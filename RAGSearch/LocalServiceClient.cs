@@ -78,11 +78,27 @@ namespace RAGSearch
             int limit,
             CancellationToken cancellationToken)
         {
+            return await SearchAsync(
+                    query,
+                    limit,
+                    null,
+                    cancellationToken)
+                .ConfigureAwait(true);
+        }
+
+        public async Task<SearchResponse> SearchAsync(
+            string query,
+            int limit,
+            IDictionary<string, object> filters,
+            CancellationToken cancellationToken)
+        {
             var request = new SearchRequest
             {
                 query = query ?? string.Empty,
                 limit = limit,
-                filters = new Dictionary<string, object>()
+                filters = filters == null
+                    ? new Dictionary<string, object>()
+                    : new Dictionary<string, object>(filters)
             };
             return await SendAsync<SearchResponse>(
                     HttpMethod.Post,

@@ -186,30 +186,35 @@ E2E positive control: отдельный сервис на `127.0.0.1:8877`, 3 P
 - production-подписка `NewMailEx -> OOM extractor` удалена: при старте RAGSearch protected getters больше не вызываются;
 - при недоступном `/health` надстройка может запустить точный workspace `service\.venv\Scripts\python.exe service\run.py`; уже работающие service processes она не завершает;
 - отдельный result window/DataGrid удалён;
-- `NativeSearchPresenter` вызывает `Explorer.Search(..., olSearchScopeAllOutlookItems)`;
-- `ClearSearch()` возвращает обычный Outlook view.
+- `NativeSearchPresenter` вызывает `Explorer.Search(..., olSearchScopeAllFolders)` в привязанном task-pane Explorer и показывает один All Mailboxes rowset из выбранных Outlook stores;
+- сервис получает `filters: {}` и ищет по всему локальному индексу, а не только в текущей папке;
+- `Сбросить фильтр` вызывает `Explorer.ClearSearch()` и возвращает исходную папку.
 
-Первый UI-прогон дал 0 результатов: add-in thread унаследовал английскую Office culture и сгенерировал `subject:`, хотя parser Outlook на этой Windows session принимает русский `тема:`. Исправление читает Windows user locale из `HKCU\Control Panel\International\LocaleName`, а не только `CurrentCulture`.
+Предыдущая текущая-folder реализация через `View.Filter` действительно оставляла Search bar пустым, но архитектурно не могла собрать PST и OST в одном списке. Live probe доказал, что широкий `Explorer.Search` даёт Inbox + Sent + PST `Archives`, а попытка наложить на этот aggregate rowset сохранённый `View.Filter` ничего не меняет: таблица осталась 14/14. Поэтому production-прототип использует финальный AQS как единственный поддержанный cross-store restriction.
+
+Property AQS оказался locale/provider-dependent: canonical `System.Subject:=...` и составные `тема:/откого:/получено:` на целевой ru-RU Windows + en-US Office либо дали 0, либо не распарсились как ожидается. Финальная версия использует короткий OR из обычных кавыченных фраз, полученных из тем результатов. Он приблизителен, но реально работает и заметно понятнее старой технической конструкции.
 
 Финальный реальный прогон:
 
 ```text
-semantic query: куку
+semantic query: дарова
+scope: AllFolders across Outlook stores selected for search
 semantic results: structured result list
-AQS clauses passed to Outlook: up to 8 / 900 chars
-AQS: (тема:"..." откого:"..." получено:...) ИЛИ ...
-fallback: тема:"..." ИЛИ тема:"..." ...
+ranking: literal gate, then vector_distance ascending; adaptive cutoff; UI top-12
+native presentation: Explorer.Search(final subject-derived quoted-phrase AQS, olSearchScopeAllFolders)
+projection identity: approximate quoted phrases derived from result subjects
+Search bar: generated query is visible by Outlook contract
 ```
 
 Финальный clean UI control выполнен после `Deny` в отдельном startup Guard: production-кнопка панели породила adapter/native process tree, закончила статусом `Native-индексация завершена: 42 писем` и не вызвала нового warning. После upsert основная БД сохранила `messages=42`, `attachments=49`, `chunks=1877`, `PRAGMA integrity_check=ok`; marker-owned native spool directories — 0.
 
-Ограничение: AQS-критерий `subject + sender + received date` — не точный identity filter. Совпадающие сообщения могут добавиться, отсутствующие/невалидные refiners опускаются, а при COM rejection выполняется subject-only retry. `All Outlook Items` зависит от Outlook Search Options. Публичный `Explorer.Search` не принимает произвольный набор `(StoreID, EntryID)`. Для точной production-проекции нужно исследовать Extended MAPI Search Folder или индексируемое служебное свойство. Подробности: [OUTLOOK_SEARCH_PROJECTION.md](OUTLOOK_SEARCH_PROJECTION.md).
+Ограничение: `Explorer.Search` неизбежно использует видимый Instant Search UI, кавыченная subject-фраза не является exact `(StoreID, EntryID)`, а native view не сортирует по внешнему SQLite vector distance. Extended MAPI Search Folder может дать exact `PR_RECORD_KEY`, но только отдельно для каждого OST/PST store; для единого cross-store списка в точном vector-порядке нужен собственный result list. Подробности: [OUTLOOK_SEARCH_PROJECTION.md](OUTLOOK_SEARCH_PROJECTION.md).
 
 ## Проверки кода
 
 Последние результаты:
 
-- `python -m unittest discover -s service\tests -t service -v`: 25/25 PASS;
+- `python -m unittest discover -s service\tests -t service -v`: 33/33 PASS;
 - `scripts\test_native_mapi_adapter_e2e.ps1`: PASS;
 - `RAGSearch.sln`, Debug build: 0 warnings, 0 errors;
 - native JSONL parsed by Python `json.loads`;

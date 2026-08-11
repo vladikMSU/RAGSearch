@@ -1,16 +1,69 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
+from dataclasses import replace
 from pathlib import Path
 
 from ragsearch_service.app import SearchService
 from ragsearch_service.config import Settings
 from ragsearch_service.http_api import create_http_server
+
+
+class ControlledEmbedder:
+    name = "controlled-test-v1"
+    dimensions = 2
+
+    @staticmethod
+    def _unit(cosine: float) -> list[float]:
+        return [cosine, math.sqrt(1.0 - cosine * cosine)]
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            if text in {"controlled-query", "controlled query"} or "near-vector" in text:
+                vectors.append(self._unit(1.0))
+            elif "close-vector" in text:
+                vectors.append(self._unit(0.96))
+            elif "window-vector" in text:
+                vectors.append(self._unit(0.94))
+            elif "far-vector" in text:
+                vectors.append(self._unit(0.70))
+            elif "very-weak-vector" in text:
+                vectors.append(self._unit(0.20))
+            elif "weak-vector" in text:
+                vectors.append(self._unit(0.35))
+            else:
+                vectors.append(self._unit(0.0))
+        return vectors
+
+
+class AdversarialShortQueryEmbedder:
+    name = "adversarial-short-query-v1"
+    dimensions = 2
+
+    @staticmethod
+    def _unit(cosine: float) -> list[float]:
+        return [cosine, math.sqrt(1.0 - cosine * cosine)]
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            folded = text.casefold()
+            if folded in {"кибер", "спорт", "киберспорт"}:
+                vectors.append(self._unit(1.0))
+            elif "киберспорт" in folded:
+                vectors.append(self._unit(0.20))
+            elif "куку" in folded:
+                vectors.append(self._unit(1.0))
+            else:
+                vectors.append(self._unit(0.0))
+        return vectors
 
 
 class SearchServiceTests(unittest.TestCase):
@@ -162,6 +215,289 @@ class SearchServiceTests(unittest.TestCase):
         self.assertTrue(results)
         self.assertEqual({"store-2"}, {item["store_id"] for item in results})
 
+    def test_search_uses_adaptive_vector_cutoff_distance_order_and_top_n(self) -> None:
+        settings = replace(
+            Settings.explicit(Path(self.temporary.name) / "controlled-ranking"),
+            search_result_limit=2,
+        )
+        service = SearchService(settings, embedder=ControlledEmbedder())
+        messages = [
+            self.message(
+                entry_id=f"entry-{label}",
+                internet_message_id=f"<{label}@example.test>",
+                subject=label,
+                body=label,
+            )
+            for label in ("far-vector", "window-vector", "near-vector", "close-vector")
+        ]
+        self.assertEqual(
+            4,
+            service.ingest_messages({"messages": messages})["accepted"],
+        )
+
+        response = service.search({"query": "controlled query", "limit": 100})
+
+        self.assertEqual(
+            "lexical_gate_then_vector_distance_asc",
+            response["ranking"],
+        )
+        self.assertEqual(4, response["candidate_count"])
+        self.assertEqual(3, response["eligible_count"])
+        self.assertEqual(2, response["max_results"])
+        self.assertAlmostEqual(0.9, response["cutoff_similarity"], places=6)
+        self.assertAlmostEqual(0.1, response["cutoff_distance"], places=6)
+        self.assertEqual(
+            ["entry-near-vector", "entry-close-vector"],
+            [item["entry_id"] for item in response["results"]],
+        )
+        self.assertEqual([1, 2], [item["rank"] for item in response["results"]])
+        self.assertLessEqual(
+            response["results"][0]["vector_distance"],
+            response["results"][1]["vector_distance"],
+        )
+        self.assertIn("hybrid_score", response["results"][0])
+
+    def test_search_returns_empty_when_best_vector_is_below_floor(self) -> None:
+        settings = Settings.explicit(Path(self.temporary.name) / "controlled-cutoff")
+        service = SearchService(settings, embedder=ControlledEmbedder())
+        messages = [
+            self.message(
+                entry_id=f"entry-{label}",
+                internet_message_id=f"<{label}@example.test>",
+                subject=label,
+                body=label,
+            )
+            for label in ("weak-vector", "very-weak-vector")
+        ]
+        service.ingest_messages({"messages": messages})
+
+        response = service.search({"query": "controlled query", "limit": 100})
+
+        self.assertEqual(2, response["candidate_count"])
+        self.assertEqual(0, response["eligible_count"])
+        self.assertEqual([], response["results"])
+        self.assertAlmostEqual(0.4, response["cutoff_similarity"], places=6)
+        self.assertAlmostEqual(0.6, response["cutoff_distance"], places=6)
+
+    def test_exact_fts_match_survives_embedding_model_change(self) -> None:
+        self.service.ingest_messages(
+            {"messages": [self.message(body="LegacyModelExactMarker")]}
+        )
+        self.service.embedder = ControlledEmbedder()
+
+        response = self.service.search(
+            {"query": "LegacyModelExactMarker", "limit": 25}
+        )
+
+        self.assertEqual(1, response["lexical_fallback_count"])
+        self.assertEqual("entry-1", response["results"][0]["entry_id"])
+        self.assertEqual(
+            "lexical_token",
+            response["results"][0]["ranking_basis"],
+        )
+
+    def test_lexical_fallback_is_not_displaced_by_weak_vector_pool(self) -> None:
+        settings = replace(
+            Settings.explicit(Path(self.temporary.name) / "mixed-model-pool"),
+            search_candidate_message_limit=2,
+        )
+        legacy_service = SearchService(settings)
+        legacy_service.ingest_messages(
+            {
+                "messages": [
+                    self.message(
+                        entry_id="legacy-exact",
+                        internet_message_id="<legacy-exact@example.test>",
+                        subject="controlled-query",
+                        body="controlled-query",
+                    )
+                ]
+            }
+        )
+        service = SearchService(settings, embedder=ControlledEmbedder())
+        service.ingest_messages(
+            {
+                "messages": [
+                    self.message(
+                        entry_id=f"current-{label}",
+                        internet_message_id=f"<current-{label}@example.test>",
+                        subject=label,
+                        body=label,
+                    )
+                    for label in ("weak-vector", "very-weak-vector")
+                ]
+            }
+        )
+
+        response = service.search({"query": "controlled-query", "limit": 2})
+
+        self.assertEqual(1, response["lexical_fallback_count"])
+        self.assertEqual(["legacy-exact"], [item["entry_id"] for item in response["results"]])
+        self.assertEqual(2, response["max_results"])
+
+    def test_vector_candidate_pool_keeps_best_chunk_per_message(self) -> None:
+        settings = replace(
+            Settings.explicit(Path(self.temporary.name) / "message-diversity"),
+            chunk_chars=64,
+            chunk_overlap_chars=0,
+        )
+        service = SearchService(settings, embedder=ControlledEmbedder())
+        service.ingest_messages(
+            {
+                "messages": [
+                    self.message(
+                        entry_id="many-near-chunks",
+                        internet_message_id="<many-near-chunks@example.test>",
+                        subject="Many chunks",
+                        body=" ".join(["near-vector"] * 40),
+                    ),
+                    self.message(
+                        entry_id="one-close-chunk",
+                        internet_message_id="<one-close-chunk@example.test>",
+                        subject="One chunk",
+                        body="close-vector",
+                    ),
+                ]
+            }
+        )
+
+        results = service.database.search(
+            "controlled-query",
+            limit=10,
+            filters={},
+            embedder=service.embedder,
+            candidate_limit=2,
+        )
+
+        self.assertEqual(
+            {"many-near-chunks", "one-close-chunk"},
+            {item["entry_id"] for item in results},
+        )
+
+    def test_single_word_prefix_and_suffix_literal_hits_beat_dense_distractor(self) -> None:
+        settings = Settings.explicit(Path(self.temporary.name) / "trigram-ranking")
+        service = SearchService(settings, embedder=AdversarialShortQueryEmbedder())
+        service.ingest_messages(
+            {
+                "messages": [
+                    self.message(
+                        entry_id="target-cybersport",
+                        internet_message_id="<target-cybersport@example.test>",
+                        subject="Target",
+                        body="КИБЕРСПОРТ и длинная история переписки",
+                    ),
+                    self.message(
+                        entry_id="dense-distractor",
+                        internet_message_id="<dense-distractor@example.test>",
+                        subject="Distractor",
+                        body="куку",
+                    ),
+                ]
+            }
+        )
+
+        expected_kinds = {
+            "киберспорт": "token",
+            "кибер": "prefix",
+            "спорт": "substring",
+        }
+        for query, expected_kind in expected_kinds.items():
+            with self.subTest(query=query):
+                response = service.search({"query": query, "limit": 25})
+                self.assertTrue(response["lexical_gate"])
+                self.assertEqual(1, response["lexical_match_count"])
+                self.assertEqual(
+                    ["target-cybersport"],
+                    [item["entry_id"] for item in response["results"]],
+                )
+                self.assertEqual(
+                    expected_kind,
+                    response["results"][0]["lexical_match_kind"],
+                )
+                self.assertEqual(
+                    "lexical_" + expected_kind,
+                    response["results"][0]["ranking_basis"],
+                )
+
+    def test_current_model_literal_hit_survives_full_vector_pool(self) -> None:
+        settings = replace(
+            Settings.explicit(Path(self.temporary.name) / "literal-vector-pool"),
+            search_candidate_message_limit=2,
+        )
+        service = SearchService(settings, embedder=AdversarialShortQueryEmbedder())
+        messages = [
+            self.message(
+                entry_id="target-cybersport",
+                internet_message_id="<target-cybersport@example.test>",
+                subject="Target",
+                body="КИБЕРСПОРТ и длинная история переписки",
+            )
+        ]
+        messages.extend(
+            self.message(
+                entry_id=f"dense-distractor-{index}",
+                internet_message_id=f"<dense-distractor-{index}@example.test>",
+                subject=f"Distractor {index}",
+                body="куку",
+            )
+            for index in range(3)
+        )
+        self.assertEqual(
+            4,
+            service.ingest_messages({"messages": messages})["accepted"],
+        )
+
+        response = service.search({"query": "кибер", "limit": 2})
+
+        self.assertTrue(response["lexical_gate"])
+        self.assertEqual(1, response["lexical_match_count"])
+        self.assertEqual(
+            ["target-cybersport"],
+            [item["entry_id"] for item in response["results"]],
+        )
+        self.assertEqual("lexical_prefix", response["results"][0]["ranking_basis"])
+
+    def test_schema_v2_rebuilds_trigram_index_for_existing_chunks(self) -> None:
+        settings = Settings.explicit(Path(self.temporary.name) / "trigram-migration")
+        service = SearchService(settings)
+        service.ingest_messages(
+            {"messages": [self.message(body="История про киберспорт")]}
+        )
+        with service.database.session() as connection:
+            for trigger in (
+                "chunks_trigram_ai",
+                "chunks_trigram_ad",
+                "chunks_trigram_au",
+            ):
+                connection.execute(f"DROP TRIGGER {trigger}")
+            connection.execute("DROP TABLE chunks_trigram")
+            connection.execute("PRAGMA user_version = 1")
+
+        service.database.initialize()
+
+        with service.database.session() as connection:
+            matches = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM chunks_trigram WHERE chunks_trigram MATCH ?",
+                    ('"спорт"',),
+                ).fetchone()[0]
+            )
+            schema_version = int(
+                connection.execute("PRAGMA user_version").fetchone()[0]
+            )
+        self.assertGreater(matches, 0)
+        self.assertEqual(2, schema_version)
+
+        service.clear_index()
+        with service.database.session() as connection:
+            self.assertEqual(
+                0,
+                connection.execute(
+                    "SELECT COUNT(*) FROM chunks_trigram WHERE chunks_trigram MATCH ?",
+                    ('"спорт"',),
+                ).fetchone()[0],
+            )
+
     def test_token_is_stable_for_explicit_test_path(self) -> None:
         original = self.service.token
         second_instance = SearchService(self.settings)
@@ -264,6 +600,14 @@ class HTTPAPITests(unittest.TestCase):
         self.assertEqual("HTTP", payload["results"][0]["store_name"])
         self.assertEqual("", payload["results"][0]["internet_message_id"])
         self.assertEqual("", payload["results"][0]["conversation_id"])
+        self.assertEqual(
+            "lexical_gate_then_vector_distance_asc",
+            payload["ranking"],
+        )
+        self.assertEqual(5, payload["max_results"])
+        self.assertEqual(1, payload["results"][0]["rank"])
+        self.assertIn("vector_similarity", payload["results"][0])
+        self.assertIn("vector_distance", payload["results"][0])
 
     def test_clear_index_requires_token(self) -> None:
         self.service.ingest_messages({"messages": [self._message()]})

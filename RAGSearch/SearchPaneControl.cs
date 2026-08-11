@@ -13,7 +13,8 @@ namespace RAGSearch
         private readonly OutlookIndexer indexer;
         private readonly OomGuardProbe oomGuardProbe;
         private readonly NativeImportRunner nativeImportRunner;
-        private readonly Func<IList<SearchResultDto>, int> showNativeResults;
+        private readonly Func<NativeFolderScope> getNativeSearchScope;
+        private readonly Func<NativeFolderScope, IList<SearchResultDto>, NativeFilterSummary> showNativeResults;
         private readonly Action clearNativeSearch;
         private readonly TextBox queryBox;
         private readonly Button searchButton;
@@ -25,6 +26,7 @@ namespace RAGSearch
         private readonly Label statusLabel;
         private CancellationTokenSource searchCancellation;
         private CancellationTokenSource resetCancellation;
+        private int searchGeneration;
         private bool probeRunning;
         private bool resetRunning;
 
@@ -33,13 +35,15 @@ namespace RAGSearch
             OutlookIndexer indexer,
             OomGuardProbe oomGuardProbe,
             NativeImportRunner nativeImportRunner,
-            Func<IList<SearchResultDto>, int> showNativeResults,
+            Func<NativeFolderScope> getNativeSearchScope,
+            Func<NativeFolderScope, IList<SearchResultDto>, NativeFilterSummary> showNativeResults,
             Action clearNativeSearch)
         {
             this.serviceClient = serviceClient ?? throw new ArgumentNullException("serviceClient");
             this.indexer = indexer ?? throw new ArgumentNullException("indexer");
             this.oomGuardProbe = oomGuardProbe ?? throw new ArgumentNullException("oomGuardProbe");
             this.nativeImportRunner = nativeImportRunner ?? throw new ArgumentNullException("nativeImportRunner");
+            this.getNativeSearchScope = getNativeSearchScope ?? throw new ArgumentNullException("getNativeSearchScope");
             this.showNativeResults = showNativeResults ?? throw new ArgumentNullException("showNativeResults");
             this.clearNativeSearch = clearNativeSearch ?? throw new ArgumentNullException("clearNativeSearch");
 
@@ -185,19 +189,22 @@ namespace RAGSearch
             }
 
             var currentCancellation = new CancellationTokenSource();
+            var currentGeneration = ++searchGeneration;
             searchCancellation = currentCancellation;
+            queryBox.Enabled = false;
             searchButton.Enabled = false;
             debugOomButton.Enabled = false;
             UpdateResetIndexButtonEnabled();
             statusLabel.Text = "Векторный + полнотекстовый поиск...";
             try
             {
+                var scope = getNativeSearchScope();
                 var response = await serviceClient.SearchAsync(
                     query,
-                    100,
+                    12,
                     currentCancellation.Token);
                 currentCancellation.Token.ThrowIfCancellationRequested();
-                if (probeRunning)
+                if (probeRunning || currentGeneration != searchGeneration)
                 {
                     throw new OperationCanceledException(currentCancellation.Token);
                 }
@@ -205,24 +212,19 @@ namespace RAGSearch
                     ? new List<SearchResultDto>()
                     : response.results;
 
-                var appliedSubjects = showNativeResults(results);
-                statusLabel.Text = results.Count == 0
-                    ? "Совпадений нет; штатный фильтр Outlook сброшен."
-                    : string.Format(
-                        "Семантических результатов: {0}; в штатный список Outlook передано {1} AQS-критериев. Сортировку задаёт Outlook.",
-                        results.Count,
-                        appliedSubjects);
+                var summary = showNativeResults(scope, results);
+                statusLabel.Text = FormatNativeFilterStatus(summary, response);
             }
             catch (OperationCanceledException)
             {
-                if (!probeRunning)
+                if (!probeRunning && currentGeneration == searchGeneration)
                 {
                     statusLabel.Text = "Поиск отменён";
                 }
             }
             catch (Exception ex)
             {
-                if (!probeRunning)
+                if (!probeRunning && currentGeneration == searchGeneration)
                 {
                     statusLabel.Text = "Поиск не выполнен: " + ex.Message;
                 }
@@ -234,6 +236,7 @@ namespace RAGSearch
                     searchCancellation = null;
                     RunOnUi(() =>
                     {
+                        queryBox.Enabled = !probeRunning && !resetRunning;
                         searchButton.Enabled = !probeRunning;
                         debugOomButton.Enabled = !probeRunning &&
                                                        !nativeImportRunner.IsRunning &&
@@ -245,12 +248,101 @@ namespace RAGSearch
             }
         }
 
+        private static string FormatNativeFilterStatus(
+            NativeFilterSummary summary,
+            SearchResponse response)
+        {
+            if (summary == null)
+            {
+                return "Поиск Outlook All Mailboxes запущен.";
+            }
+
+            var hasRankingDetails = response != null &&
+                                    string.Equals(
+                                        response.ranking,
+                                        "lexical_gate_then_vector_distance_asc",
+                                        StringComparison.Ordinal);
+            var rankingText = string.Empty;
+            if (hasRankingDetails && response.lexical_gate)
+            {
+                rankingText = string.Format(
+                    "Literal-совпадений: {0}; сервис вернул: {1}; top-N: {2}. ",
+                    response.lexical_match_count,
+                    response.total,
+                    response.max_results);
+            }
+            else if (hasRankingDetails &&
+                     string.Equals(
+                         response.mode,
+                         "single-token-no-literal",
+                         StringComparison.Ordinal))
+            {
+                rankingText =
+                    "Literal-совпадений нет; для чисто семантического поиска введите фразу из двух или более слов. ";
+            }
+            else if (hasRankingDetails)
+            {
+                rankingText = string.Format(
+                    "Кандидатов: {0}; cutoff d≤{1}; прошло: {2}; literal: {3}; top-N: {4}. ",
+                    response.candidate_count,
+                    response.cutoff_distance.ToString("0.000"),
+                    response.eligible_count,
+                    response.lexical_match_count,
+                    response.max_results);
+            }
+            if (summary.ResultCount == 0)
+            {
+                return rankingText +
+                    "Релевантных совпадений нет; агрегированный список All Mailboxes оставлен пустым до сброса.";
+            }
+
+            if (summary.AppliedClauseCount == 0)
+            {
+                return string.Format(
+                    "{0}Сервис вернул {1}, но ни один результат нельзя представить через Outlook Instant Search; список оставлен пустым.",
+                    rankingText,
+                    summary.ResultCount);
+            }
+
+            var text = string.Format(
+                "{0}Сервис вернул {1}; в All Mailboxes передано условий: {2}. Поиск охватывает выбранные в Outlook почтовые хранилища и архивы.",
+                rankingText,
+                summary.ResultCount,
+                summary.AppliedClauseCount);
+            if (hasRankingDetails)
+            {
+                text += response.lexical_gate
+                    ? " Сервис отдаёт literal-совпадения первыми; native-список сохраняет порядок Outlook."
+                    : " Векторная часть сервиса ранжирована по distance (d↑); native-список сохраняет порядок Outlook.";
+            }
+            if (summary.ApproximateClauseCount > 0)
+            {
+                text += " Проекция приблизительная: Outlook AQS ищет кавыченные фразы из тем результатов (в том числе в теле письма), а не EntryID.";
+            }
+            if (summary.SkippedCount > 0)
+            {
+                text += string.Format(
+                    " Не удалось представить в view: {0}.",
+                    summary.SkippedCount);
+            }
+            if (summary.ProjectionWasTruncated)
+            {
+                text += " Технический запрос укорочен до безопасного лимита Outlook.";
+            }
+            return text;
+        }
+
         private void ClearButtonOnClick(object sender, EventArgs eventArgs)
         {
             try
             {
+                searchGeneration++;
+                if (searchCancellation != null)
+                {
+                    searchCancellation.Cancel();
+                }
                 clearNativeSearch();
-                statusLabel.Text = "Штатный фильтр Outlook сброшен.";
+                statusLabel.Text = "Поиск Outlook All Mailboxes сброшен.";
             }
             catch (Exception ex)
             {
@@ -583,15 +675,15 @@ namespace RAGSearch
                 }
                 if (searchCancellation != null)
                 {
-                    searchCancellation.Cancel();
-                    searchCancellation.Dispose();
+                    var cancellation = searchCancellation;
                     searchCancellation = null;
+                    cancellation.Cancel();
                 }
                 if (resetCancellation != null)
                 {
-                    resetCancellation.Cancel();
-                    resetCancellation.Dispose();
+                    var cancellation = resetCancellation;
                     resetCancellation = null;
+                    cancellation.Cancel();
                 }
             }
 

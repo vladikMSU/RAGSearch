@@ -15,7 +15,7 @@ from .embeddings import Embedder, blob_to_vector, cosine_for_normalized, vector_
 from .errors import ValidationError
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _SEARCH_TOKEN = re.compile(r"[\w@.+-]+", re.UNICODE)
 
 
@@ -54,6 +54,9 @@ class Database:
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.session() as connection:
+            previous_schema_version = int(
+                connection.execute("PRAGMA user_version").fetchone()[0]
+            )
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
@@ -131,6 +134,13 @@ class Database:
                     tokenize='unicode61 remove_diacritics 2'
                 );
 
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_trigram USING fts5(
+                    text,
+                    content='chunks',
+                    content_rowid='id',
+                    tokenize='trigram'
+                );
+
                 CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
                     INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
                 END;
@@ -144,12 +154,31 @@ class Database:
                     INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
                 END;
 
+                CREATE TRIGGER IF NOT EXISTS chunks_trigram_ai AFTER INSERT ON chunks BEGIN
+                    INSERT INTO chunks_trigram(rowid, text) VALUES (new.id, new.text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS chunks_trigram_ad AFTER DELETE ON chunks BEGIN
+                    INSERT INTO chunks_trigram(chunks_trigram, rowid, text)
+                    VALUES ('delete', old.id, old.text);
+                END;
+                CREATE TRIGGER IF NOT EXISTS chunks_trigram_au AFTER UPDATE ON chunks BEGIN
+                    INSERT INTO chunks_trigram(chunks_trigram, rowid, text)
+                    VALUES ('delete', old.id, old.text);
+                    INSERT INTO chunks_trigram(rowid, text) VALUES (new.id, new.text);
+                END;
+
                 CREATE TABLE IF NOT EXISTS service_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
                 """
             )
+            if previous_schema_version < 2:
+                # External-content FTS indexes do not backfill themselves when
+                # first added to an existing database.
+                connection.execute(
+                    "INSERT INTO chunks_trigram(chunks_trigram) VALUES ('rebuild')"
+                )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def ping(self) -> bool:
@@ -172,6 +201,9 @@ class Database:
             connection.execute("DELETE FROM attachments")
             connection.execute("DELETE FROM messages")
             connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
+            connection.execute(
+                "INSERT INTO chunks_trigram(chunks_trigram) VALUES ('rebuild')"
+            )
 
         return {
             "deleted_messages": counts["messages"],
@@ -397,6 +429,38 @@ class Database:
         return " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens)
 
     @staticmethod
+    def _trigram_expression(query: str) -> str:
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for match in _SEARCH_TOKEN.finditer(query):
+            token = match.group(0).casefold()
+            if len(token) >= 3 and token not in seen:
+                seen.add(token)
+                tokens.append(token)
+            if len(tokens) >= 32:
+                break
+        return " AND ".join('"' + token.replace('"', '""') + '"' for token in tokens)
+
+    @staticmethod
+    def _prefix_expression(query: str) -> str:
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for match in _SEARCH_TOKEN.finditer(query):
+            token = match.group(0).casefold()
+            if len(token) >= 3 and token not in seen:
+                seen.add(token)
+                tokens.append(token)
+            if len(tokens) >= 32:
+                break
+        return " AND ".join(
+            '"' + token.replace('"', '""') + '"*' for token in tokens
+        )
+
+    @staticmethod
+    def _lexical_kind_priority(kind: str) -> int:
+        return {"token": 3, "prefix": 2, "substring": 1}.get(kind, 0)
+
+    @staticmethod
     def _row_payload(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "chunk_id": row["chunk_id"],
@@ -454,33 +518,57 @@ class Database:
 
         with self.session() as connection:
             fts_expression = self._fts_expression(query)
-            lexical_rows: list[tuple[sqlite3.Row, float]] = []
-            if fts_expression:
+            prefix_expression = self._prefix_expression(query)
+            trigram_expression = self._trigram_expression(query)
+            lexical_rows: dict[int, tuple[sqlite3.Row, float, str]] = {}
+            for table_name, expression, match_kind in (
+                ("chunks_fts", fts_expression, "token"),
+                ("chunks_fts", prefix_expression, "prefix"),
+                ("chunks_trigram", trigram_expression, "substring"),
+            ):
+                if not expression:
+                    continue
                 lexical_sql = f"""
                     SELECT {select_fields}, c.embedding, c.embedding_model, c.embedding_dim,
-                           bm25(chunks_fts) AS lexical_rank
-                    FROM chunks_fts
-                    JOIN chunks c ON c.id = chunks_fts.rowid
+                           bm25({table_name}) AS lexical_rank
+                    FROM {table_name}
+                    JOIN chunks c ON c.id = {table_name}.rowid
                     JOIN messages m ON m.id = c.message_id
-                    WHERE chunks_fts MATCH ? {filter_sql}
+                    WHERE {table_name} MATCH ? {filter_sql}
                     ORDER BY lexical_rank
                     LIMIT ?
                 """
-                parameters = [fts_expression, *filter_parameters, candidate_limit]
-                for row in connection.execute(lexical_sql, parameters):
-                    lexical_rows.append((row, max(0.0, -float(row["lexical_rank"]))))
+                parameters = [expression, *filter_parameters, candidate_limit]
+                rows = list(connection.execute(lexical_sql, parameters))
+                maximum_score = max(
+                    (max(0.0, -float(row["lexical_rank"])) for row in rows),
+                    default=1.0,
+                ) or 1.0
+                for row in rows:
+                    score = max(0.0, -float(row["lexical_rank"])) / maximum_score
+                    chunk_id = int(row["chunk_id"])
+                    current = lexical_rows.get(chunk_id)
+                    if current is None or score > current[1] or (
+                        score == current[1]
+                        and self._lexical_kind_priority(match_kind)
+                        > self._lexical_kind_priority(current[2])
+                    ):
+                        lexical_rows[chunk_id] = (row, score, match_kind)
 
-            maximum_lexical = max((score for _, score in lexical_rows), default=1.0) or 1.0
-            for row, raw_score in lexical_rows:
+            for row, lexical_score, match_kind in lexical_rows.values():
                 payload = self._row_payload(row)
-                payload["lexical"] = raw_score / maximum_lexical
+                payload["lexical"] = lexical_score
+                payload["lexical_match_kind"] = match_kind
                 payload["vector"] = 0.0
+                payload["vector_available"] = False
                 try:
                     stored = blob_to_vector(row["embedding"], int(row["embedding_dim"]))
                     if row["embedding_model"] == embedder.name and len(stored) == len(query_vector):
-                        payload["vector"] = max(
-                            0.0, cosine_for_normalized(query_vector, stored)
+                        payload["vector"] = min(
+                            1.0,
+                            max(0.0, cosine_for_normalized(query_vector, stored)),
                         )
+                        payload["vector_available"] = True
                 except (TypeError, ValueError):
                     pass
                 candidates[int(row["chunk_id"])] = payload
@@ -492,26 +580,38 @@ class Database:
                 WHERE c.embedding_model = ? AND c.embedding_dim = ? {filter_sql}
             """
             vector_parameters = [embedder.name, embedder.dimensions, *filter_parameters]
-            heap: list[tuple[float, int, sqlite3.Row]] = []
+            best_vector_chunk_by_message: dict[
+                int, tuple[float, int, sqlite3.Row]
+            ] = {}
             for row in connection.execute(vector_sql, vector_parameters):
                 try:
                     stored = blob_to_vector(row["embedding"], embedder.dimensions)
                 except (TypeError, ValueError):
                     continue
-                similarity = max(0.0, cosine_for_normalized(query_vector, stored))
+                similarity = min(
+                    1.0,
+                    max(0.0, cosine_for_normalized(query_vector, stored)),
+                )
                 item = (similarity, int(row["chunk_id"]), row)
-                if len(heap) < candidate_limit:
-                    heapq.heappush(heap, item)
-                elif item[:2] > heap[0][:2]:
-                    heapq.heapreplace(heap, item)
+                message_id = int(row["message_id"])
+                current = best_vector_chunk_by_message.get(message_id)
+                if current is None or item[:2] > current[:2]:
+                    best_vector_chunk_by_message[message_id] = item
 
-            for similarity, chunk_id, row in heap:
+            vector_candidates = heapq.nlargest(
+                candidate_limit,
+                best_vector_chunk_by_message.values(),
+                key=lambda item: item[:2],
+            )
+            for similarity, chunk_id, row in vector_candidates:
                 existing = candidates.get(chunk_id)
                 if existing is None:
                     existing = self._row_payload(row)
                     existing["lexical"] = 0.0
+                    existing["lexical_match_kind"] = ""
                     candidates[chunk_id] = existing
                 existing["vector"] = max(float(existing.get("vector", 0.0)), similarity)
+                existing["vector_available"] = True
 
         folded_query = query.casefold()
         ranked_chunks: list[tuple[float, dict[str, Any]]] = []
@@ -545,16 +645,99 @@ class Database:
                     "store_name": candidate["store_name"],
                     "internet_message_id": candidate["internet_message_id"],
                     "conversation_id": candidate["conversation_id"],
-                    "score": round(score, 6),
+                    "vector_similarity": float(candidate["vector"]),
+                    "vector_available": bool(candidate.get("vector_available", False)),
+                    "lexical_score": float(candidate["lexical"]),
+                    "lexical_match_kind": str(
+                        candidate.get("lexical_match_kind", "")
+                    ),
+                    "hybrid_score": float(score),
                     "snippet": self._snippet(candidate["text"], query),
                     "matched_sources": [source],
                 }
                 by_message[message_id] = result
-            elif source not in result["matched_sources"] and len(result["matched_sources"]) < 8:
-                result["matched_sources"].append(source)
+            else:
+                result["vector_similarity"] = max(
+                    float(result["vector_similarity"]),
+                    float(candidate["vector"]),
+                )
+                result["vector_available"] = bool(result["vector_available"]) or bool(
+                    candidate.get("vector_available", False)
+                )
+                candidate_lexical = float(candidate["lexical"])
+                current_lexical = float(result["lexical_score"])
+                candidate_kind = str(candidate.get("lexical_match_kind", ""))
+                if candidate_lexical > current_lexical or (
+                    candidate_lexical == current_lexical
+                    and self._lexical_kind_priority(candidate_kind)
+                    > self._lexical_kind_priority(
+                        str(result["lexical_match_kind"])
+                    )
+                ):
+                    result["lexical_score"] = candidate_lexical
+                    result["lexical_match_kind"] = candidate_kind
+                result["hybrid_score"] = max(
+                    float(result["hybrid_score"]),
+                    float(score),
+                )
+                if source not in result["matched_sources"] and len(result["matched_sources"]) < 8:
+                    result["matched_sources"].append(source)
 
-        results = sorted(by_message.values(), key=lambda result: -float(result["score"]))
-        return results[:limit]
+        results = list(by_message.values())
+        for result in results:
+            similarity = min(1.0, max(0.0, float(result["vector_similarity"])))
+            hybrid_score = min(1.0, max(0.0, float(result["hybrid_score"])))
+            result["vector_similarity"] = round(similarity, 6)
+            result["vector_distance"] = round(1.0 - similarity, 6)
+            result["lexical_score"] = round(
+                min(1.0, max(0.0, float(result["lexical_score"]))),
+                6,
+            )
+            result["hybrid_score"] = round(hybrid_score, 6)
+            # Keep the old field for API compatibility. New consumers should use
+            # vector_distance for ordering and hybrid_score for diagnostics.
+            result["score"] = result["hybrid_score"]
+
+        results.sort(
+            key=lambda result: (
+                0 if bool(result["vector_available"]) else 1,
+                float(result["vector_distance"]),
+                -float(result["hybrid_score"]),
+                str(result["store_id"]),
+                str(result["entry_id"]),
+            )
+        )
+        vector_results = [result for result in results if bool(result["vector_available"])]
+        lexical_results = [
+            result
+            for result in results
+            if float(result["lexical_score"]) > 0.0
+        ]
+        lexical_results.sort(
+            key=lambda result: (
+                -self._lexical_kind_priority(str(result["lexical_match_kind"])),
+                -float(result["lexical_score"]),
+                0 if bool(result["vector_available"]) else 1,
+                float(result["vector_distance"]),
+                -float(result["hybrid_score"]),
+                str(result["store_id"]),
+                str(result["entry_id"]),
+            )
+        )
+
+        # Keep independently bounded vector and lexical pools, then merge by
+        # Outlook identity. A current-model literal hit can have a weak cosine
+        # score (especially for a short query), so it must not be displaced by
+        # the vector top-K before the service-layer literal gate sees it.
+        merged: list[dict[str, Any]] = []
+        seen_identities: set[tuple[str, str]] = set()
+        for result in vector_results[:limit] + lexical_results[:limit]:
+            identity = (str(result["store_id"]), str(result["entry_id"]))
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+            merged.append(result)
+        return merged
 
     def stats(self) -> dict[str, Any]:
         with self.session() as connection:

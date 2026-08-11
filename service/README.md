@@ -94,6 +94,8 @@ Attachment paths are resolved (including symlinks) and rejected unless they rema
 ```
 
 Supported filters: `store_id`, `store_ids`, `folder_entry_id`, `folder_path`, `folder_path_prefix`, `sender_email`, `received_from`, `received_to`, `has_attachments`.
+The Outlook All Mailboxes projection deliberately sends `filters: {}` so the
+service can return matches from every indexed OST/PST store.
 
 Response fields are stable for VSTO navigation:
 
@@ -110,14 +112,47 @@ Response fields are stable for VSTO navigation:
       "received_at": "2026-08-11T09:01:00Z",
       "folder_path": "\\Mailbox - User\\Inbox",
       "score": 0.91,
+      "hybrid_score": 0.91,
+      "lexical_score": 0.74,
+      "lexical_match_kind": "token",
+      "vector_similarity": 0.77,
+      "vector_distance": 0.23,
+      "rank": 1,
+      "ranking_basis": "lexical_token",
       "snippet": "The launch was moved to October.",
       "matched_sources": ["body", "attachment:notes.txt"]
     }
-  ]
+  ],
+  "mode": "hybrid-semantic",
+  "candidate_count": 42,
+  "eligible_count": 7,
+  "lexical_match_count": 1,
+  "lexical_fallback_count": 0,
+  "lexical_gate": false,
+  "cutoff_similarity": 0.67,
+  "cutoff_distance": 0.33,
+  "max_results": 25,
+  "ranking": "lexical_gate_then_vector_distance_asc"
 }
 ```
 
-The service ranks chunks, then collapses them to one result per Outlook message. Sources are `message_metadata`, `body`, or `attachment:<name>`.
+The service aggregates the best chunk per Outlook message before selecting the
+message candidate pools. `vector_similarity` is the best compatible-model chunk
+cosine and `vector_distance = 1 - vector_similarity`. For multi-token queries,
+literal matches are followed by semantic candidates ordered by distance, using
+an adaptive cutoff (`max(model floor, best similarity - 0.10)`) and a hard cap of
+25 messages. The dense-model floor is `0.40`; the hashing fallback uses `0.30`
+because cosine distributions are model-specific.
+
+Literal retrieval uses both the `unicode61` token index and an FTS5 `trigram`
+index. `lexical_match_kind` is `token`, `prefix`, `substring`, or empty. A
+prefix/substring hit enables `lexical_gate` and excludes unrelated dense guesses;
+for a single-token query any literal hit wins, while a single token with no
+literal evidence returns `mode=single-token-no-literal`. This avoids the observed
+short-query pathology where the multilingual paraphrase model ranked an unrelated
+four-letter body above `киберспорт`. Schema v2 rebuilds the trigram external-content
+index for existing chunks automatically, and `DELETE /v1/index` clears both FTS
+indexes. Sources remain `message_metadata`, `body`, or `attachment:<name>`.
 
 ### Stats
 

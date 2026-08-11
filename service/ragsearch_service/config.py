@@ -25,6 +25,11 @@ class Settings:
     chunk_chars: int = 1_200
     chunk_overlap_chars: int = 180
     vector_candidate_limit: int = 200
+    search_candidate_message_limit: int = 100
+    search_result_limit: int = 25
+    minimum_vector_similarity: float = 0.40
+    hashing_minimum_vector_similarity: float = 0.30
+    vector_similarity_window: float = 0.10
     delete_spool_after_ingest: bool = False
 
     @classmethod

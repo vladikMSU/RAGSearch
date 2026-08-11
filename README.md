@@ -10,9 +10,9 @@
 
 - Верхняя панель `RAG Search` внутри Outlook.
 - Гибридный FTS5 + vector поиск по сообщениям и вложениям.
-- Результаты проецируются в штатную центральную таблицу Outlook через `Explorer.Search`; отдельного окна/грида нет.
-- Кнопка `Сбросить фильтр` возвращает обычный Outlook view.
-- Русский AQS определяется по Windows user locale, даже если UI Outlook английский.
+- Для фраз сервис ранжирует semantic-кандидатов по минимальному vector distance до лучшего чанка и применяет adaptive cutoff. API допускает до 25 результатов, а native Outlook-проекция запрашивает максимум 12 — столько же, сколько безопасно помещается в финальный AQS. Для одного слова literal token/prefix/substring имеет приоритет; без literal-совпадения заведомо нестабильный dense guess не показывается.
+- Результаты всего локального индекса проецируются в штатный центральный список через `Explorer.Search(..., olSearchScopeAllFolders)`: один `All Mailboxes` view объединяет Inbox, Sent и выбранные Outlook архивные/PST stores.
+- Кнопка `Сбросить фильтр` вызывает `Explorer.ClearSearch()` и возвращает обычный список исходной папки.
 - Основная кнопка индексации запускает отдельный read-only Extended MAPI worker; отдельная debug-кнопка синхронно читает один protected OOM getter на одном письме и служит negative control.
 - Кнопка `Очистить базу` после подтверждения удаляет только локальный поисковый индекс и позволяет повторить векторизацию с нуля; Outlook, PST и OST не изменяются.
 - Надстройка не подписывает OOM extractor на `NewMailEx`, поэтому сама RAGSearch больше не должна вызывать Guard во время старта Outlook.
@@ -23,9 +23,9 @@
 
 Финальный clean UI-контроль под strict policy: пользователь нажал `Deny` в чужом startup Guard, затем кнопка `Индексировать PST + OST (MAPI)` из панели завершилась статусом `Native-индексация завершена: 42 писем`; нового Guard не появилось.
 
-Проекция в native view строит до 8 компактных AQS-критериев из темы, отправителя и локальной даты получения; если Outlook отвергает уточнённый запрос, надстройка повторяет его только по теме. Семантический результат при этом остаётся структурированным списком сообщений, а не одним склеенным текстом.
+Outlook не даёт публичного cross-store rowset API отдельно от Instant Search UI. Поэтому presenter строит компактный финальный AQS из тем прошедших service cutoff: каждая тема превращается в обычную кавыченную фразу, после чего поиск запускается с `olSearchScopeAllFolders`. Кавыченные фразы выбраны намеренно: canonical `System.Subject` и локализованные `subject:`/`тема:` на проверенной комбинации ru-RU Windows + en-US Office либо дали ноль, либо зависели от locale. Пустая service-выдача запускает заведомо несуществующую sentinel-фразу и оставляет All Mailboxes пустым до сброса.
 
-Публичный `Explorer.Search` не принимает произвольный набор `(StoreID, EntryID)`, поэтому это всё ещё приближённая проекция: одинаковые тема/отправитель/дата могут дать дополнительные строки, Outlook сам сортирует результаты, а scope зависит от его Search Options. Для математически точного production-набора нужен MAPI Search Folder/служебное индексируемое свойство либо собственный grid.
+Этот компромисс реально собирает один native список из основного OST, Sent и PST `Archives`, но имеет две честные границы. Во-первых, Outlook показывает сгенерированную строку в Search bar и может найти дополнительные письма с той же фразой в теме/теле: поддержанного AQS-сравнения по `(StoreID, EntryID)` нет. Во-вторых, vector distance — внешнее значение SQLite, а native Outlook view сортирует только по свойствам писем, поэтому сервисный top-N и cutoff сохраняются в критериях, но порядок строк выбирает Outlook. Полный набор `cross-store + точная identity + пустой Search bar + vector order` требует собственного result list; Search Folder без строки поиска ограничен одним store.
 
 ## PST и OST: что именно читается
 
@@ -111,12 +111,12 @@ powershell.exe -NoProfile -File .\scripts\test_native_mapi_adapter_e2e.ps1
 & $msbuild .\RAGSearch.sln /t:Build /p:Configuration=Debug /m
 ```
 
-Последний прогон: 25/25 Python tests, native-MAPI-to-service E2E PASS даже при открытом Guard, VSTO build — 0 warnings/0 errors. Полный read-only MAPI scan дал ровно 42 письма (16 OST + 26 PST), 49 вложений, 31 корректно пропущенный non-mail объект и 0 ошибок. Основная neural DB содержит 42 сообщения, 49 вложений и 1 877 chunks.
+Последний прогон: 33/33 Python tests, native-MAPI-to-service E2E PASS, VSTO rebuild — 0 warnings/0 errors. Отдельный live probe подтвердил один `All Mailboxes` rowset с письмами из Inbox, Sent и PST `Archives`; `View.Filter` поверх него Outlook игнорирует, поэтому production-путь использует финальный AQS. Контрольный read-only MAPI scan дал 42 письма (16 OST + 26 PST), 49 вложений, 31 корректно пропущенный non-mail объект и 0 ошибок; после новых тестовых писем текущая neural DB содержит 44 сообщения, 49 вложений и 1 883 chunks (`schema_version=2`).
 
 ## До production
 
 - добавить инкрементальные MAPI notifications/checkpoints вместо полного повторного scan;
-- сделать точную native Search Folder projection, если subject phrase projection недостаточна;
+- при необходимости точной cross-store identity заменить AQS-проекцию собственным result list; MAPI Search Folder по `PR_RECORD_KEY` возможен только отдельно в каждом store;
 - заменить brute-force cosine на ANN для больших архивов;
 - добавить reconciliation/tombstones для перемещений и удалений;
 - изолировать тяжёлый extraction, добавить AV/resource quotas;

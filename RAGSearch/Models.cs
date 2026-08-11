@@ -107,6 +107,28 @@ namespace RAGSearch
         public int total { get; set; }
         [DataMember(Name = "mode")]
         public string mode { get; set; }
+        [DataMember(Name = "candidate_count")]
+        public int candidate_count { get; set; }
+        [DataMember(Name = "eligible_count")]
+        public int eligible_count { get; set; }
+        [DataMember(Name = "lexical_match_count")]
+        public int lexical_match_count { get; set; }
+        [DataMember(Name = "lexical_fallback_count")]
+        public int lexical_fallback_count { get; set; }
+        [DataMember(Name = "lexical_gate")]
+        public bool lexical_gate { get; set; }
+        [DataMember(Name = "best_vector_similarity")]
+        public double best_vector_similarity { get; set; }
+        [DataMember(Name = "best_vector_distance")]
+        public double best_vector_distance { get; set; }
+        [DataMember(Name = "cutoff_similarity")]
+        public double cutoff_similarity { get; set; }
+        [DataMember(Name = "cutoff_distance")]
+        public double cutoff_distance { get; set; }
+        [DataMember(Name = "max_results")]
+        public int max_results { get; set; }
+        [DataMember(Name = "ranking")]
+        public string ranking { get; set; }
     }
 
     [DataContract]
@@ -147,6 +169,20 @@ namespace RAGSearch
         public string conversation_id { get; set; }
         [DataMember(Name = "score")]
         public double score { get; set; }
+        [DataMember(Name = "vector_similarity")]
+        public double vector_similarity { get; set; }
+        [DataMember(Name = "vector_distance")]
+        public double vector_distance { get; set; }
+        [DataMember(Name = "hybrid_score")]
+        public double hybrid_score { get; set; }
+        [DataMember(Name = "lexical_score")]
+        public double lexical_score { get; set; }
+        [DataMember(Name = "lexical_match_kind")]
+        public string lexical_match_kind { get; set; }
+        [DataMember(Name = "rank")]
+        public int rank { get; set; }
+        [DataMember(Name = "ranking_basis")]
+        public string ranking_basis { get; set; }
         [DataMember(Name = "snippet")]
         public string snippet { get; set; }
         [DataMember(Name = "matched_sources")]
@@ -155,7 +191,7 @@ namespace RAGSearch
         [IgnoreDataMember]
         public string ScoreDisplay
         {
-            get { return score.ToString("0.000"); }
+            get { return vector_distance.ToString("0.000"); }
         }
 
         [IgnoreDataMember]

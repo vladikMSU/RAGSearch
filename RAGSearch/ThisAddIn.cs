@@ -35,24 +35,27 @@ namespace RAGSearch
 
                 oomGuardProbe = new OomGuardProbe(Application);
                 nativeImportRunner = new NativeImportRunner(serviceClient);
-                nativeSearchPresenter = new NativeSearchPresenter(Application);
-                StartupTrace.Step("constructed native runner, lazy OOM helpers and search presenter");
-
-                StartupTrace.Step("BEGIN SearchPaneControl constructor (WinForms only)");
-                searchPaneControl = new SearchPaneControl(
-                    serviceClient,
-                    indexer,
-                    oomGuardProbe,
-                    nativeImportRunner,
-                    nativeSearchPresenter.Show,
-                    nativeSearchPresenter.Clear);
-                StartupTrace.Step("END SearchPaneControl constructor");
+                StartupTrace.Step("constructed native runner and lazy OOM helpers");
 
                 StartupTrace.Step("BEGIN Application.ActiveExplorer (window lookup; no mail/address getters)");
                 taskPaneExplorer = Application.ActiveExplorer();
                 StartupTrace.Step("END Application.ActiveExplorer; found=" + (taskPaneExplorer != null));
                 if (taskPaneExplorer != null)
                 {
+                    nativeSearchPresenter = new NativeSearchPresenter(taskPaneExplorer);
+                    StartupTrace.Step("constructed native view presenter bound to task-pane Explorer");
+
+                    StartupTrace.Step("BEGIN SearchPaneControl constructor (WinForms only)");
+                    searchPaneControl = new SearchPaneControl(
+                        serviceClient,
+                        indexer,
+                        oomGuardProbe,
+                        nativeImportRunner,
+                        nativeSearchPresenter.GetCurrentScope,
+                        nativeSearchPresenter.Show,
+                        nativeSearchPresenter.Clear);
+                    StartupTrace.Step("END SearchPaneControl constructor");
+
                     StartupTrace.Step("BEGIN CustomTaskPanes.Add/show");
                     searchTaskPane = CustomTaskPanes.Add(
                         searchPaneControl,
@@ -69,6 +72,42 @@ namespace RAGSearch
             catch (Exception ex)
             {
                 StartupTrace.Failure("ThisAddIn_Startup", ex);
+                try
+                {
+                    if (searchPaneControl != null)
+                    {
+                        searchPaneControl.Dispose();
+                    }
+                }
+                catch (Exception cleanupException)
+                {
+                    StartupTrace.Failure(
+                        "ThisAddIn_Startup SearchPaneControl cleanup",
+                        cleanupException);
+                }
+                finally
+                {
+                    searchPaneControl = null;
+                }
+                try
+                {
+                    if (nativeSearchPresenter != null)
+                    {
+                        nativeSearchPresenter.Dispose();
+                    }
+                }
+                catch (Exception cleanupException)
+                {
+                    StartupTrace.Failure(
+                        "ThisAddIn_Startup NativeSearchPresenter cleanup",
+                        cleanupException);
+                }
+                finally
+                {
+                    nativeSearchPresenter = null;
+                    ComRelease.Final(taskPaneExplorer);
+                    taskPaneExplorer = null;
+                }
                 throw;
             }
 
@@ -94,6 +133,12 @@ namespace RAGSearch
                 searchPaneControl = null;
             }
 
+            if (nativeSearchPresenter != null)
+            {
+                nativeSearchPresenter.Dispose();
+                nativeSearchPresenter = null;
+            }
+
             if (indexer != null)
             {
                 indexer.Dispose();
@@ -116,7 +161,6 @@ namespace RAGSearch
 
             ComRelease.Final(taskPaneExplorer);
             taskPaneExplorer = null;
-            nativeSearchPresenter = null;
 
             // Outlook no longer raises this event during shutdown. See:
             // https://go.microsoft.com/fwlink/?LinkId=506785

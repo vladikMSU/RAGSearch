@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any
 
 from .attachments import ExtractedAttachment, extract_attachment
@@ -10,6 +11,9 @@ from .database import Database
 from .embeddings import Embedder, create_embedder
 from .errors import ValidationError
 from .security import ensure_private_path, load_or_create_token
+
+
+_SEARCH_TOKEN = re.compile(r"[\w@.+-]+", re.UNICODE)
 
 
 def _required_text(payload: dict[str, Any], name: str) -> str:
@@ -265,14 +269,125 @@ class SearchService:
         limit = payload.get("limit", 20)
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
             raise ValidationError("limit must be an integer between 1 and 100")
-        results = self.database.search(
+        candidate_message_limit = max(
+            limit,
+            self.settings.search_candidate_message_limit,
+        )
+        candidates = self.database.search(
             query.strip(),
-            limit=limit,
+            limit=candidate_message_limit,
             filters=payload.get("filters"),
             embedder=self.embedder,
-            candidate_limit=max(limit * 10, self.settings.vector_candidate_limit),
+            candidate_limit=max(
+                candidate_message_limit * 10,
+                self.settings.vector_candidate_limit,
+            ),
         )
-        return {"results": results}
+
+        minimum_similarity = self.settings.minimum_vector_similarity
+        if self.embedder.name.startswith("hashing-"):
+            # Cosine distributions are model-specific. The dependency-free
+            # hashing fallback needs a lower floor than a dense semantic model.
+            minimum_similarity = self.settings.hashing_minimum_vector_similarity
+
+        vector_candidates = [
+            item for item in candidates if bool(item["vector_available"])
+        ]
+        best_similarity = max(
+            (float(item["vector_similarity"]) for item in vector_candidates),
+            default=0.0,
+        )
+        cutoff_similarity = max(
+            minimum_similarity,
+            best_similarity - self.settings.vector_similarity_window,
+        )
+        vector_eligible = [
+            item
+            for item in vector_candidates
+            if float(item["vector_similarity"]) + 1e-9 >= cutoff_similarity
+        ]
+        lexical_matches = [
+            item for item in candidates if float(item["lexical_score"]) > 0.0
+        ]
+        lexical_fallback = [
+            item
+            for item in lexical_matches
+            if not bool(item["vector_available"])
+        ]
+        query_tokens = {
+            match.group(0).casefold() for match in _SEARCH_TOKEN.finditer(query)
+        }
+        fragment_matches = [
+            item
+            for item in lexical_matches
+            if item.get("lexical_match_kind") in {"prefix", "substring"}
+        ]
+        lexical_gate = bool(fragment_matches) or (
+            len(query_tokens) == 1 and bool(lexical_matches)
+        )
+
+        lexical_matches.sort(
+            key=lambda item: (
+                0 if bool(item["vector_available"]) else 1,
+                float(item["vector_distance"]),
+                -float(item["hybrid_score"]),
+                str(item["store_id"]),
+                str(item["entry_id"]),
+            )
+        )
+        lexical_identities = {
+            (str(item["store_id"]), str(item["entry_id"]))
+            for item in lexical_matches
+        }
+        semantic_matches = [
+            item
+            for item in vector_eligible
+            if (str(item["store_id"]), str(item["entry_id"]))
+            not in lexical_identities
+        ]
+        if lexical_gate:
+            eligible = lexical_matches
+        elif len(query_tokens) == 1:
+            # The current multilingual paraphrase model is demonstrably
+            # unreliable for isolated words (for example спорт vs куку). Do not
+            # manufacture a semantic hit when there is no literal evidence.
+            eligible = []
+        else:
+            eligible = lexical_matches + semantic_matches
+        maximum_results = min(limit, self.settings.search_result_limit)
+        results = eligible[:maximum_results]
+        for rank, result in enumerate(results, start=1):
+            result["rank"] = rank
+            match_kind = str(result.get("lexical_match_kind", ""))
+            result["ranking_basis"] = (
+                "lexical_" + match_kind if match_kind else "vector_distance"
+            )
+
+        cutoff_similarity = min(1.0, max(0.0, cutoff_similarity))
+        return {
+            "results": results,
+            "total": len(results),
+            "mode": (
+                "lexical-fragment"
+                if fragment_matches
+                else "lexical-exact"
+                if lexical_gate
+                else "single-token-no-literal"
+                if len(query_tokens) == 1
+                else "hybrid-semantic"
+            ),
+            "candidate_count": len(candidates),
+            "eligible_count": len(eligible),
+            "lexical_match_count": len(lexical_matches),
+            "lexical_fallback_count": len(lexical_fallback),
+            "lexical_gate": lexical_gate,
+            "best_vector_similarity": round(best_similarity, 6),
+            "best_vector_distance": round(1.0 - best_similarity, 6),
+            "cutoff_similarity": round(cutoff_similarity, 6),
+            "cutoff_distance": round(1.0 - cutoff_similarity, 6),
+            "max_results": maximum_results,
+            "ranking": "lexical_gate_then_vector_distance_asc",
+        }
 
     def clear_index(self) -> dict[str, int]:
         return self.database.clear_index()
