@@ -1,0 +1,5 @@
+# The default runtime and test suite use only the Python 3.11+ standard library.
+#
+# Optional local neural embeddings (never downloaded by the service):
+#   python -m pip install "sentence-transformers>=3.0,<6"
+

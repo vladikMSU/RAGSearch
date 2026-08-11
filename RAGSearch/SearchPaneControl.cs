@@ -1,0 +1,601 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace RAGSearch
+{
+    internal sealed class SearchPaneControl : UserControl
+    {
+        private readonly LocalServiceClient serviceClient;
+        private readonly OutlookIndexer indexer;
+        private readonly OomGuardProbe oomGuardProbe;
+        private readonly NativeImportRunner nativeImportRunner;
+        private readonly Func<IList<SearchResultDto>, int> showNativeResults;
+        private readonly Action clearNativeSearch;
+        private readonly TextBox queryBox;
+        private readonly Button searchButton;
+        private readonly Button clearButton;
+        private readonly Button indexButton;
+        private readonly Button stopButton;
+        private readonly Button resetIndexButton;
+        private readonly Button debugOomButton;
+        private readonly Label statusLabel;
+        private CancellationTokenSource searchCancellation;
+        private CancellationTokenSource resetCancellation;
+        private bool probeRunning;
+        private bool resetRunning;
+
+        public SearchPaneControl(
+            LocalServiceClient serviceClient,
+            OutlookIndexer indexer,
+            OomGuardProbe oomGuardProbe,
+            NativeImportRunner nativeImportRunner,
+            Func<IList<SearchResultDto>, int> showNativeResults,
+            Action clearNativeSearch)
+        {
+            this.serviceClient = serviceClient ?? throw new ArgumentNullException("serviceClient");
+            this.indexer = indexer ?? throw new ArgumentNullException("indexer");
+            this.oomGuardProbe = oomGuardProbe ?? throw new ArgumentNullException("oomGuardProbe");
+            this.nativeImportRunner = nativeImportRunner ?? throw new ArgumentNullException("nativeImportRunner");
+            this.showNativeResults = showNativeResults ?? throw new ArgumentNullException("showNativeResults");
+            this.clearNativeSearch = clearNativeSearch ?? throw new ArgumentNullException("clearNativeSearch");
+
+            Dock = DockStyle.Fill;
+            BackColor = SystemColors.Window;
+            MinimumSize = new Size(600, 96);
+
+            queryBox = new TextBox
+            {
+                Width = 520,
+                Font = new Font("Segoe UI", 10F),
+                Margin = new Padding(8, 7, 5, 3)
+            };
+            queryBox.KeyDown += QueryBoxOnKeyDown;
+
+            searchButton = CreateButton("Семантический поиск");
+            searchButton.Click += SearchButtonOnClick;
+
+            clearButton = CreateButton("Сбросить фильтр");
+            clearButton.Click += ClearButtonOnClick;
+
+            indexButton = CreateButton("Индексировать PST + OST (MAPI)");
+            indexButton.Click += IndexButtonOnClick;
+
+            stopButton = CreateButton("Стоп");
+            stopButton.Enabled = false;
+            stopButton.Click += StopButtonOnClick;
+
+            resetIndexButton = CreateButton("Очистить базу");
+            resetIndexButton.Click += ResetIndexButtonOnClick;
+
+            debugOomButton = CreateButton("Debug OOM: 1 письмо → Guard");
+            debugOomButton.Click += DebugOomButtonOnClick;
+
+            statusLabel = new Label
+            {
+                AutoEllipsis = true,
+                Dock = DockStyle.Fill,
+                Font = new Font("Segoe UI", 8.5F),
+                ForeColor = SystemColors.GrayText,
+                Padding = new Padding(8, 2, 4, 0),
+                Text = "Локальный сервис: проверка..."
+            };
+
+            var searchRow = CreateRow();
+            searchRow.Controls.Add(queryBox);
+            searchRow.Controls.Add(searchButton);
+            searchRow.Controls.Add(clearButton);
+
+            var toolsRow = CreateRow();
+            toolsRow.Controls.Add(indexButton);
+            toolsRow.Controls.Add(stopButton);
+            toolsRow.Controls.Add(resetIndexButton);
+            toolsRow.Controls.Add(debugOomButton);
+
+            var layout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 3,
+                Margin = new Padding(0),
+                // Current Microsoft 365 builds draw the vertical app rail over the
+                // left edge of a top task pane. Keep controls out from under it.
+                Padding = new Padding(52, 0, 0, 0)
+            };
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32F));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            layout.Controls.Add(searchRow, 0, 0);
+            layout.Controls.Add(toolsRow, 0, 1);
+            layout.Controls.Add(statusLabel, 0, 2);
+            Controls.Add(layout);
+
+            indexer.SetUiControl(this);
+            indexer.ProgressChanged += IndexerOnProgressChanged;
+            nativeImportRunner.ProgressChanged += NativeImportRunnerOnProgressChanged;
+            Load += async (sender, args) =>
+            {
+                StartupTrace.Step("BEGIN SearchPaneControl.Load (loopback health only)");
+                try
+                {
+                    await RefreshHealthAsync();
+                    StartupTrace.Step("END SearchPaneControl.Load");
+                }
+                catch (Exception ex)
+                {
+                    StartupTrace.Failure("SearchPaneControl.Load", ex);
+                    throw;
+                }
+            };
+        }
+
+        private static FlowLayoutPanel CreateRow()
+        {
+            return new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = false,
+                FlowDirection = FlowDirection.LeftToRight,
+                WrapContents = false,
+                BackColor = SystemColors.ControlLightLight,
+                Padding = new Padding(0)
+            };
+        }
+
+        private static Button CreateButton(string text)
+        {
+            return new Button
+            {
+                AutoSize = true,
+                FlatStyle = FlatStyle.System,
+                Font = new Font("Segoe UI", 9F),
+                Margin = new Padding(3, 5, 3, 3),
+                Padding = new Padding(5, 1, 5, 1),
+                Text = text,
+                UseVisualStyleBackColor = true
+            };
+        }
+
+        private async void SearchButtonOnClick(object sender, EventArgs eventArgs)
+        {
+            await SearchAsync();
+        }
+
+        private async Task SearchAsync()
+        {
+            if (probeRunning || resetRunning)
+            {
+                return;
+            }
+
+            var query = queryBox.Text.Trim();
+            if (query.Length == 0)
+            {
+                statusLabel.Text = "Введите запрос. Можно описать смысл, точная подстрока не обязательна.";
+                return;
+            }
+
+            if (searchCancellation != null)
+            {
+                searchCancellation.Cancel();
+            }
+
+            var currentCancellation = new CancellationTokenSource();
+            searchCancellation = currentCancellation;
+            searchButton.Enabled = false;
+            debugOomButton.Enabled = false;
+            UpdateResetIndexButtonEnabled();
+            statusLabel.Text = "Векторный + полнотекстовый поиск...";
+            try
+            {
+                var response = await serviceClient.SearchAsync(
+                    query,
+                    100,
+                    currentCancellation.Token);
+                currentCancellation.Token.ThrowIfCancellationRequested();
+                if (probeRunning)
+                {
+                    throw new OperationCanceledException(currentCancellation.Token);
+                }
+                var results = response == null || response.results == null
+                    ? new List<SearchResultDto>()
+                    : response.results;
+
+                var appliedSubjects = showNativeResults(results);
+                statusLabel.Text = results.Count == 0
+                    ? "Совпадений нет; штатный фильтр Outlook сброшен."
+                    : string.Format(
+                        "Семантических результатов: {0}; в штатный список Outlook передано {1} AQS-критериев. Сортировку задаёт Outlook.",
+                        results.Count,
+                        appliedSubjects);
+            }
+            catch (OperationCanceledException)
+            {
+                if (!probeRunning)
+                {
+                    statusLabel.Text = "Поиск отменён";
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!probeRunning)
+                {
+                    statusLabel.Text = "Поиск не выполнен: " + ex.Message;
+                }
+            }
+            finally
+            {
+                if (ReferenceEquals(searchCancellation, currentCancellation))
+                {
+                    searchCancellation = null;
+                    RunOnUi(() =>
+                    {
+                        searchButton.Enabled = !probeRunning;
+                        debugOomButton.Enabled = !probeRunning &&
+                                                       !nativeImportRunner.IsRunning &&
+                                                       !indexer.IsRunning;
+                        UpdateResetIndexButtonEnabled();
+                    });
+                }
+                currentCancellation.Dispose();
+            }
+        }
+
+        private void ClearButtonOnClick(object sender, EventArgs eventArgs)
+        {
+            try
+            {
+                clearNativeSearch();
+                statusLabel.Text = "Штатный фильтр Outlook сброшен.";
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = "Не удалось сбросить фильтр Outlook: " + ex.Message;
+            }
+        }
+
+        private async void IndexButtonOnClick(object sender, EventArgs eventArgs)
+        {
+            if (resetRunning)
+            {
+                statusLabel.Text = "Дождитесь завершения очистки локального индекса.";
+                return;
+            }
+            if (nativeImportRunner.IsRunning || indexer.IsRunning)
+            {
+                statusLabel.Text = "Индексация уже выполняется.";
+                return;
+            }
+
+            indexButton.Enabled = false;
+            debugOomButton.Enabled = false;
+            UpdateResetIndexButtonEnabled();
+            stopButton.Enabled = true;
+            statusLabel.Text = "Готовлю read-only Extended MAPI индексацию...";
+            try
+            {
+                await nativeImportRunner.RunAsync();
+            }
+            catch (OperationCanceledException)
+            {
+                RunOnUi(() => statusLabel.Text = "Native-индексация остановлена пользователем.");
+            }
+            catch (Exception ex)
+            {
+                var message = "Native-индексация не выполнена: " + ex.Message;
+                RunOnUi(() => statusLabel.Text = message);
+            }
+            finally
+            {
+                RunOnUi(() =>
+                {
+                    indexButton.Enabled = !resetRunning;
+                    debugOomButton.Enabled = !resetRunning && searchCancellation == null;
+                    stopButton.Enabled = false;
+                    UpdateResetIndexButtonEnabled();
+                });
+            }
+        }
+
+        private void StopButtonOnClick(object sender, EventArgs eventArgs)
+        {
+            if (nativeImportRunner.IsRunning)
+            {
+                nativeImportRunner.RequestStop();
+                stopButton.Enabled = false;
+                return;
+            }
+            if (indexer.IsRunning)
+            {
+                indexer.Stop();
+            }
+        }
+
+        private void DebugOomButtonOnClick(object sender, EventArgs eventArgs)
+        {
+            if (resetRunning)
+            {
+                statusLabel.Text = "Дождитесь завершения очистки локального индекса.";
+                return;
+            }
+            if (probeRunning || nativeImportRunner.IsRunning || indexer.IsRunning)
+            {
+                statusLabel.Text = "Сначала остановите текущую индексацию.";
+                return;
+            }
+            if (searchCancellation != null)
+            {
+                statusLabel.Text = "Дождитесь завершения семантического поиска перед Debug OOM.";
+                return;
+            }
+
+            probeRunning = true;
+            queryBox.Enabled = false;
+            searchButton.Enabled = false;
+            clearButton.Enabled = false;
+            indexButton.Enabled = false;
+            debugOomButton.Enabled = false;
+            UpdateResetIndexButtonEnabled();
+            stopButton.Enabled = false;
+            try
+            {
+                // Keep this synchronous on the Outlook UI thread.  The probe
+                // locates one MailItem and immediately calls one documented
+                // protected getter; it does not depend on the service or Timer.
+                var result = oomGuardProbe.Run(message =>
+                {
+                    statusLabel.Text = message;
+                    statusLabel.Update();
+                });
+                statusLabel.Text = result;
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text = "Debug OOM завершился внутренней ошибкой: " + ex.GetType().Name;
+            }
+            finally
+            {
+                probeRunning = false;
+                queryBox.Enabled = true;
+                searchButton.Enabled = true;
+                clearButton.Enabled = true;
+                indexButton.Enabled = true;
+                debugOomButton.Enabled = true;
+                stopButton.Enabled = false;
+                UpdateResetIndexButtonEnabled();
+            }
+        }
+
+        private async void ResetIndexButtonOnClick(object sender, EventArgs eventArgs)
+        {
+            if (resetRunning)
+            {
+                return;
+            }
+            if (nativeImportRunner.IsRunning || indexer.IsRunning)
+            {
+                statusLabel.Text = "Сначала остановите текущую индексацию.";
+                return;
+            }
+            if (searchCancellation != null)
+            {
+                statusLabel.Text = "Дождитесь завершения семантического поиска.";
+                return;
+            }
+            if (probeRunning)
+            {
+                statusLabel.Text = "Дождитесь завершения Debug OOM.";
+                return;
+            }
+
+            var confirmation = MessageBox.Show(
+                this,
+                "Удалить весь локальный поисковый индекс RAGSearch?\r\n\r\n" +
+                "Будут удалены только данные локальной базы: проиндексированные сообщения, " +
+                "вложения и векторные чанки. Письма и вложения в Outlook, PST и OST " +
+                "не изменятся.\r\n\r\nДля поиска потребуется заново выполнить индексацию.",
+                "RAGSearch: очистка локального индекса",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+            if (confirmation != DialogResult.Yes)
+            {
+                return;
+            }
+
+            // A modal dialog pumps messages. Recheck all activity immediately
+            // before issuing the destructive local-service request.
+            if (nativeImportRunner.IsRunning || indexer.IsRunning ||
+                searchCancellation != null || probeRunning)
+            {
+                statusLabel.Text = "Очистка отменена: другая операция уже выполняется.";
+                UpdateResetIndexButtonEnabled();
+                return;
+            }
+
+            var currentCancellation = new CancellationTokenSource();
+            resetCancellation = currentCancellation;
+            resetRunning = true;
+            queryBox.Enabled = false;
+            searchButton.Enabled = false;
+            clearButton.Enabled = false;
+            indexButton.Enabled = false;
+            stopButton.Enabled = false;
+            debugOomButton.Enabled = false;
+            resetIndexButton.Enabled = false;
+            statusLabel.Text = "Проверяю локальный сервис перед очисткой индекса...";
+            var completionStatus = "Очистка локального индекса завершилась без результата.";
+            try
+            {
+                await nativeImportRunner.EnsureServiceReadyAsync(currentCancellation.Token);
+                currentCancellation.Token.ThrowIfCancellationRequested();
+                var response = await serviceClient.ResetIndexAsync(currentCancellation.Token);
+                currentCancellation.Token.ThrowIfCancellationRequested();
+                completionStatus = response == null
+                    ? "Локальный индекс очищен; сервис не вернул счётчики."
+                    : string.Format(
+                        "Локальный индекс очищен: сообщений {0}, вложений {1}, чанков {2}.",
+                        response.deleted_messages,
+                        response.deleted_attachments,
+                        response.deleted_chunks);
+            }
+            catch (OperationCanceledException)
+            {
+                completionStatus = "Очистка локального индекса отменена.";
+            }
+            catch (Exception ex)
+            {
+                completionStatus = "Не удалось очистить локальный индекс: " + ex.Message;
+            }
+            finally
+            {
+                if (ReferenceEquals(resetCancellation, currentCancellation))
+                {
+                    resetCancellation = null;
+                }
+                currentCancellation.Dispose();
+                RunOnUi(() =>
+                {
+                    resetRunning = false;
+                    statusLabel.Text = completionStatus;
+                    queryBox.Enabled = true;
+                    clearButton.Enabled = true;
+                    searchButton.Enabled = searchCancellation == null && !probeRunning;
+                    var indexing = nativeImportRunner.IsRunning || indexer.IsRunning;
+                    indexButton.Enabled = !indexing && !probeRunning;
+                    stopButton.Enabled = indexing;
+                    debugOomButton.Enabled = !indexing &&
+                                                   !probeRunning &&
+                                                   searchCancellation == null;
+                    UpdateResetIndexButtonEnabled();
+                });
+            }
+        }
+
+        private void QueryBoxOnKeyDown(object sender, KeyEventArgs eventArgs)
+        {
+            if (eventArgs.KeyCode != Keys.Enter)
+            {
+                return;
+            }
+
+            eventArgs.SuppressKeyPress = true;
+            if (!searchButton.Enabled)
+            {
+                return;
+            }
+            SearchButtonOnClick(sender, EventArgs.Empty);
+        }
+
+        private void IndexerOnProgressChanged(object sender, IndexProgress progress)
+        {
+            RunOnUi(() =>
+            {
+                stopButton.Enabled = progress.IsRunning;
+                indexButton.Enabled = !progress.IsRunning && !resetRunning;
+                debugOomButton.Enabled = !progress.IsRunning && !resetRunning;
+                UpdateResetIndexButtonEnabled();
+                statusLabel.Text = string.Format(
+                    "DEBUG OOM (Guard ожидаем): {0}: {1}/{2}, ошибок {3}{4}",
+                    progress.Status,
+                    progress.Processed,
+                    progress.EstimatedTotal,
+                    progress.Failed,
+                    string.IsNullOrWhiteSpace(progress.CurrentFolder)
+                        ? string.Empty
+                        : ". " + progress.CurrentFolder);
+            });
+        }
+
+        private void NativeImportRunnerOnProgressChanged(object sender, NativeImportProgress progress)
+        {
+            RunOnUi(() =>
+            {
+                var active = nativeImportRunner.IsRunning;
+                stopButton.Enabled = progress.IsRunning && active;
+                indexButton.Enabled = !active && !resetRunning;
+                debugOomButton.Enabled = !active && !resetRunning;
+                UpdateResetIndexButtonEnabled();
+                statusLabel.Text = progress.Status;
+            });
+        }
+
+        private void UpdateResetIndexButtonEnabled()
+        {
+            resetIndexButton.Enabled = !resetRunning &&
+                                       !probeRunning &&
+                                       searchCancellation == null &&
+                                       !nativeImportRunner.IsRunning &&
+                                       !indexer.IsRunning;
+        }
+
+        private async Task RefreshHealthAsync()
+        {
+            try
+            {
+                var health = await serviceClient.GetHealthAsync(CancellationToken.None);
+                statusLabel.Text = string.Format(
+                    "Локальный сервис готов. Embeddings: {0}",
+                    health == null ? "unknown" : health.embedding_backend ?? health.status ?? "unknown");
+            }
+            catch (Exception)
+            {
+                statusLabel.Text = "Python-сервис не запущен. Запустите python service\\run.py.";
+            }
+        }
+
+        private void RunOnUi(Action action)
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            if (InvokeRequired)
+            {
+                try
+                {
+                    BeginInvoke(action);
+                }
+                catch (InvalidOperationException)
+                {
+                    // Outlook is closing or the task pane handle is gone.
+                }
+                return;
+            }
+
+            action();
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                indexer.ProgressChanged -= IndexerOnProgressChanged;
+                nativeImportRunner.ProgressChanged -= NativeImportRunnerOnProgressChanged;
+                if (nativeImportRunner.IsRunning)
+                {
+                    nativeImportRunner.RequestStop();
+                }
+                if (searchCancellation != null)
+                {
+                    searchCancellation.Cancel();
+                    searchCancellation.Dispose();
+                    searchCancellation = null;
+                }
+                if (resetCancellation != null)
+                {
+                    resetCancellation.Cancel();
+                    resetCancellation.Dispose();
+                    resetCancellation = null;
+                }
+            }
+
+            base.Dispose(disposing);
+        }
+    }
+}

@@ -1,0 +1,8 @@
+/build/
+/build-direct/
+/.vs/
+/x64/
+/Debug/
+/Release/
+*.user
+*.suo
