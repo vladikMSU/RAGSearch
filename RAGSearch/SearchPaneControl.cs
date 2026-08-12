@@ -10,7 +10,6 @@ namespace RAGSearch
     internal sealed class SearchPaneControl : UserControl
     {
         private readonly LocalServiceClient serviceClient;
-        private readonly OutlookIndexer indexer;
         private readonly OomGuardProbe oomGuardProbe;
         private readonly NativeImportRunner nativeImportRunner;
         private readonly Func<NativeFolderScope> getNativeSearchScope;
@@ -32,7 +31,6 @@ namespace RAGSearch
 
         public SearchPaneControl(
             LocalServiceClient serviceClient,
-            OutlookIndexer indexer,
             OomGuardProbe oomGuardProbe,
             NativeImportRunner nativeImportRunner,
             Func<NativeFolderScope> getNativeSearchScope,
@@ -40,7 +38,6 @@ namespace RAGSearch
             Action clearNativeSearch)
         {
             this.serviceClient = serviceClient ?? throw new ArgumentNullException("serviceClient");
-            this.indexer = indexer ?? throw new ArgumentNullException("indexer");
             this.oomGuardProbe = oomGuardProbe ?? throw new ArgumentNullException("oomGuardProbe");
             this.nativeImportRunner = nativeImportRunner ?? throw new ArgumentNullException("nativeImportRunner");
             this.getNativeSearchScope = getNativeSearchScope ?? throw new ArgumentNullException("getNativeSearchScope");
@@ -118,8 +115,6 @@ namespace RAGSearch
             layout.Controls.Add(statusLabel, 0, 2);
             Controls.Add(layout);
 
-            indexer.SetUiControl(this);
-            indexer.ProgressChanged += IndexerOnProgressChanged;
             nativeImportRunner.ProgressChanged += NativeImportRunnerOnProgressChanged;
             Load += async (sender, args) =>
             {
@@ -239,8 +234,7 @@ namespace RAGSearch
                         queryBox.Enabled = !probeRunning && !resetRunning;
                         searchButton.Enabled = !probeRunning;
                         debugOomButton.Enabled = !probeRunning &&
-                                                       !nativeImportRunner.IsRunning &&
-                                                       !indexer.IsRunning;
+                                                       !nativeImportRunner.IsRunning;
                         UpdateResetIndexButtonEnabled();
                     });
                 }
@@ -357,7 +351,7 @@ namespace RAGSearch
                 statusLabel.Text = "Дождитесь завершения очистки локального индекса.";
                 return;
             }
-            if (nativeImportRunner.IsRunning || indexer.IsRunning)
+            if (nativeImportRunner.IsRunning)
             {
                 statusLabel.Text = "Индексация уже выполняется.";
                 return;
@@ -401,10 +395,6 @@ namespace RAGSearch
                 stopButton.Enabled = false;
                 return;
             }
-            if (indexer.IsRunning)
-            {
-                indexer.Stop();
-            }
         }
 
         private void DebugOomButtonOnClick(object sender, EventArgs eventArgs)
@@ -414,7 +404,7 @@ namespace RAGSearch
                 statusLabel.Text = "Дождитесь завершения очистки локального индекса.";
                 return;
             }
-            if (probeRunning || nativeImportRunner.IsRunning || indexer.IsRunning)
+            if (probeRunning || nativeImportRunner.IsRunning)
             {
                 statusLabel.Text = "Сначала остановите текущую индексацию.";
                 return;
@@ -468,7 +458,7 @@ namespace RAGSearch
             {
                 return;
             }
-            if (nativeImportRunner.IsRunning || indexer.IsRunning)
+            if (nativeImportRunner.IsRunning)
             {
                 statusLabel.Text = "Сначала остановите текущую индексацию.";
                 return;
@@ -501,8 +491,7 @@ namespace RAGSearch
 
             // A modal dialog pumps messages. Recheck all activity immediately
             // before issuing the destructive local-service request.
-            if (nativeImportRunner.IsRunning || indexer.IsRunning ||
-                searchCancellation != null || probeRunning)
+            if (nativeImportRunner.IsRunning || searchCancellation != null || probeRunning)
             {
                 statusLabel.Text = "Очистка отменена: другая операция уже выполняется.";
                 UpdateResetIndexButtonEnabled();
@@ -557,7 +546,7 @@ namespace RAGSearch
                     queryBox.Enabled = true;
                     clearButton.Enabled = true;
                     searchButton.Enabled = searchCancellation == null && !probeRunning;
-                    var indexing = nativeImportRunner.IsRunning || indexer.IsRunning;
+                    var indexing = nativeImportRunner.IsRunning;
                     indexButton.Enabled = !indexing && !probeRunning;
                     stopButton.Enabled = indexing;
                     debugOomButton.Enabled = !indexing &&
@@ -583,26 +572,6 @@ namespace RAGSearch
             SearchButtonOnClick(sender, EventArgs.Empty);
         }
 
-        private void IndexerOnProgressChanged(object sender, IndexProgress progress)
-        {
-            RunOnUi(() =>
-            {
-                stopButton.Enabled = progress.IsRunning;
-                indexButton.Enabled = !progress.IsRunning && !resetRunning;
-                debugOomButton.Enabled = !progress.IsRunning && !resetRunning;
-                UpdateResetIndexButtonEnabled();
-                statusLabel.Text = string.Format(
-                    "DEBUG OOM (Guard ожидаем): {0}: {1}/{2}, ошибок {3}{4}",
-                    progress.Status,
-                    progress.Processed,
-                    progress.EstimatedTotal,
-                    progress.Failed,
-                    string.IsNullOrWhiteSpace(progress.CurrentFolder)
-                        ? string.Empty
-                        : ". " + progress.CurrentFolder);
-            });
-        }
-
         private void NativeImportRunnerOnProgressChanged(object sender, NativeImportProgress progress)
         {
             RunOnUi(() =>
@@ -621,8 +590,7 @@ namespace RAGSearch
             resetIndexButton.Enabled = !resetRunning &&
                                        !probeRunning &&
                                        searchCancellation == null &&
-                                       !nativeImportRunner.IsRunning &&
-                                       !indexer.IsRunning;
+                                       !nativeImportRunner.IsRunning;
         }
 
         private async Task RefreshHealthAsync()
@@ -667,7 +635,6 @@ namespace RAGSearch
         {
             if (disposing)
             {
-                indexer.ProgressChanged -= IndexerOnProgressChanged;
                 nativeImportRunner.ProgressChanged -= NativeImportRunnerOnProgressChanged;
                 if (nativeImportRunner.IsRunning)
                 {

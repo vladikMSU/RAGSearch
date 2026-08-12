@@ -5,6 +5,10 @@
 *.user
 *.suo
 
+# Local signing credentials
+*.pfx
+*.p12
+
 # Native build output
 [Bb]uild/
 [Bb]uild-direct/

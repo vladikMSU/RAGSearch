@@ -106,21 +106,17 @@ Guard продолжал блокировать main Outlook UI после по�
 
 ## PST и OST без путаницы
 
-### Debug VSTO/OOM путь
+### Удалённый Debug VSTO/OOM путь
 
-`OutlookIndexer.cs` делает следующее:
+Ранний прототип содержал полный OOM scanner: он подключал PST через
+`NameSpace.AddStore`, перечислял `Application.Session.Stores`, обходил folders/items
+и отправлял DTO Python-сервису. Этот код был недостижим из текущего UI и удалён из
+production-проекта 12 августа 2026 года вместе с обслуживающими DTO.
 
-1. Ищет только верхнеуровневые `*.pst` в `%USERPROFILE%\Documents\Outlook Files`.
-2. Отсутствующие PST подключает через `NameSpace.AddStore`.
-3. Перебирает `Application.Session.Stores`.
-4. Одинаково обходит folders/items каждого store.
-5. Отправляет структурированные DTO Python-сервису.
-
-PST читается не raw-парсером, а подключённым PST store provider. OST также не открывается как файл: Outlook отдаёт текущий Exchange cached store через тот же `Session.Stores`. Для OST нет другого поля/объекта; различается provider за store.
-
-Закрывать Outlook и копировать OST для этого пути не требуется. Но OOM protected properties под strict policy будут под Guard.
-
-Полный legacy scanner больше не используется кнопкой negative control. Предыдущая реализация сначала делала `await GetHealthAsync()`: startup/pane работали на `tid=1`, а continuation и `OutlookIndexer.Start()` реально ушли на thread-pool `tid=11`. Запущенный там `WinForms.Timer` не имел UI message pump, поэтому `Tick` не наступил ни разу. Статус успел показать подготовленные `0/42`, но protected getter ещё не был достигнут — отсутствие Guard ничего не доказывало.
+Историческая причина отказа от него: после `await GetHealthAsync()` continuation
+переходил с Outlook UI thread на thread pool, а `WinForms.Timer` без message pump не
+давал ни одного `Tick`. Статус показывал `0/42`, хотя protected getter ещё не был
+вызван; отсутствие Guard ничего не доказывало.
 
 Исправленный `OomGuardProbe.cs` работает синхронно в click-handler без `await` и не обращается к Python-сервису или Timer. Он требует один явно выбранный `MailItem`, не обходит folders/stores и сразу читает документированное protected-свойство `MailItem.SenderEmailAddress`. Значение немедленно отбрасывается и никогда не попадает в UI/log. Фазы и HRESULT записываются в `%LOCALAPPDATA%\RAGSearch\oom-guard-probe.log`; результат различает normal return, документированный для Deny `MAPI_E_NOT_SUPPORTED`, наблюдавшийся на этой сборке Outlook `E_FAIL`, известные `E_ABORT`/`E_ACCESSDENIED` и прочие COM exceptions. На время modal Guard блокируются поиск и остальные действия панели. Нажатия `Allow`/`Deny` не автоматизируются.
 
@@ -182,8 +178,8 @@ E2E positive control: отдельный сервис на `127.0.0.1:8877`, 3 P
 - production-кнопка `Индексировать PST + OST (MAPI)` запускает full-scan adapter асинхронно без shell/UAC и показывает progress;
 - `Очистить базу` показывает warning с `No` по умолчанию, при необходимости запускает локальный service и через authenticated `DELETE /v1/index` удаляет только сообщения/вложения/чанки/FTS из локального индекса;
 - `Стоп` сначала создаёт уникальный cancellation sentinel, затем ограниченно ждёт graceful shutdown и только после таймаута завершает принадлежащее этому запуску Windows Job tree;
-- отдельная кнопка `Debug OOM: 1 письмо → Guard` немедленно вызывает один protected OOM getter и служит детерминированным negative control; полный legacy scanner к кнопке больше не подключён;
-- production-подписка `NewMailEx -> OOM extractor` удалена: при старте RAGSearch protected getters больше не вызываются;
+- отдельная кнопка `Debug OOM: 1 письмо → Guard` немедленно вызывает один protected OOM getter и служит детерминированным negative control;
+- полный legacy OOM scanner, его extractor/DTO и подписка `NewMailEx` удалены из production-проекта: при старте RAGSearch protected getters не вызываются;
 - при недоступном `/health` надстройка может запустить точный workspace `service\.venv\Scripts\python.exe service\run.py`; уже работающие service processes она не завершает;
 - отдельный result window/DataGrid удалён;
 - `NativeSearchPresenter` вызывает `Explorer.Search(..., olSearchScopeAllFolders)` в привязанном task-pane Explorer и показывает один All Mailboxes rowset из выбранных Outlook stores;
@@ -220,7 +216,7 @@ Search bar: generated query is visible by Outlook contract
 - native JSONL parsed by Python `json.loads`;
 - real PST/OST read-only probes: exit 0.
 
-Standard MSBuild native-проекта сейчас блокируется отсутствующим Visual Studio workload `Desktop development with C++`/`Microsoft.Cpp.Default.props`. Проверочный binary собран доступным x64 compiler toolchain с официальными MAPIStubLibrary headers. Для воспроизводимого production build workload надо установить штатно.
+Standard MSBuild native-проекта сейчас блокируется отсутствующим Visual Studio workload `Desktop development with C++`/`Microsoft.Cpp.Default.props`. Проверочный binary собран доступным x64 compiler toolchain. Минимальный набор официальных MAPIStubLibrary headers, точный upstream commit и MIT-лицензия теперь зафиксированы в `third_party\MAPIStubLibrary`; для штатной MSBuild-сборки остаётся установить только C++ workload.
 
 ## Целевая production-архитектура
 

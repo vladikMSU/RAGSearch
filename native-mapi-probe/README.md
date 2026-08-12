@@ -30,9 +30,13 @@ Outlook, поэтому Outlook может быть открыт, а блоки�
   только `x64`.
 - Visual Studio 2022: workload **Desktop development with C++**, MSVC v143 и Windows
   10/11 SDK.
-- Заголовки Extended MAPI: `mapix.h`, `mapiutil.h`, `mapitags.h`; одного `MAPI.h`
-  Simple MAPI недостаточно. Microsoft распространяет их в MAPIStubLibrary:
-  <https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/how-to-install-mapi-header-files>.
+- Минимальный набор Extended MAPI headers из официального Microsoft
+  MAPIStubLibrary уже зафиксирован в
+  `..\third_party\MAPIStubLibrary\include`. Точный upstream commit и MIT-лицензия
+  записаны рядом в `README.md` и `LICENSE`.
+
+MSBuild/CMake также копирует `THIRD_PARTY_NOTICES.md` и
+`MAPIStubLibrary-LICENSE.txt` рядом с EXE. Сохраняйте их в бинарной поставке.
 
 Microsoft отдельно требует совпадения bitness MAPI application и установленного
 Outlook: <https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/building-mapi-applications-on-32-bit-and-64-bit-platforms>.
@@ -44,39 +48,36 @@ Outlook: <https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi
 ```powershell
 msbuild .\NativeMapiProbe.vcxproj /m `
   /p:Configuration=Release `
-  /p:Platform=x64 `
-  /p:MapiIncludeDir=C:\path\to\MAPIStubLibrary\include
+  /p:Platform=x64
 ```
 
 Бинарник:
 
 ```text
-x64\Release\NativeMapiProbe.exe
+build-direct\NativeMapiProbe.exe
 ```
 
 ## Сборка через CMake
 
 ```powershell
-cmake -S . -B build -A x64 `
-  -DMAPI_INCLUDE_DIR=C:\path\to\MAPIStubLibrary\include
+cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
 Бинарник для Visual Studio generator:
 
 ```text
-build\Release\NativeMapiProbe.exe
+build-direct\NativeMapiProbe.exe
 ```
 
 ### Direct build, использованный на этой машине
 
 На машине нет штатного C++ workload, но есть bundled x64 ScopeCppSDK. Проверенный
-эквивалентный Release build выполнен так (путь к распакованным официальным
-MAPIStubLibrary headers подставляется явно):
+эквивалентный Release build выполнен с headers из репозитория:
 
 ```powershell
 $scopeSdk = 'C:\Program Files\Microsoft Visual Studio\2022\Community\SDK\ScopeCppSDK\vc15'
-$mapiHeaders = 'C:\path\to\MAPIStubLibrary\include'
+$mapiHeaders = (Resolve-Path '..\third_party\MAPIStubLibrary\include').Path
 $env:INCLUDE = "$mapiHeaders;$scopeSdk\VC\include;$scopeSdk\SDK\include\ucrt;$scopeSdk\SDK\include\um;$scopeSdk\SDK\include\shared"
 $env:LIB = "$scopeSdk\VC\lib;$scopeSdk\SDK\lib"
 $env:PATH = "$scopeSdk\VC\bin;$scopeSdk\SDK\bin;$env:PATH"
@@ -93,7 +94,7 @@ $env:PATH = "$scopeSdk\VC\bin;$scopeSdk\SDK\bin;$env:PATH"
 Первый короткий positive-control:
 
 ```powershell
-.\x64\Release\NativeMapiProbe.exe `
+.\build-direct\NativeMapiProbe.exe `
   --max-stores 0 `
   --max-folders 25 `
   --max-messages 5 `
@@ -104,7 +105,7 @@ $env:PATH = "$scopeSdk\VC\bin;$scopeSdk\SDK\bin;$env:PATH"
 дорогой, поэтому его стоит делать только осознанно:
 
 ```powershell
-.\x64\Release\NativeMapiProbe.exe `
+.\build-direct\NativeMapiProbe.exe `
   --max-folders 0 `
   --max-messages 0 `
   --body-preview-chars 500
@@ -114,7 +115,7 @@ $env:PATH = "$scopeSdk\VC\bin;$scopeSdk\SDK\bin;$env:PATH"
 name `Archives`:
 
 ```powershell
-.\x64\Release\NativeMapiProbe.exe `
+.\build-direct\NativeMapiProbe.exe `
   --store-contains Archives `
   --max-folders 25 `
   --max-messages 5
@@ -130,7 +131,7 @@ Progress, recoverable errors и итоговый summary направляютс�
 stdout можно безопасно читать построчно из Python без concat всего mailbox:
 
 ```powershell
-.\x64\Release\NativeMapiProbe.exe `
+.\build-direct\NativeMapiProbe.exe `
   --jsonl `
   --max-folders 100 `
   --max-messages 1000 `
@@ -249,9 +250,9 @@ Programmatic Access. Итоговое поведение всё равно за�
 Полный штатный build через установленный Visual Studio сейчас недоступен: на машине
 не установлен workload Desktop development with C++ (`Microsoft.Cpp.Default.props`
 отсутствует), а `cmake` не находится в `PATH`. Для proof использован имеющийся x64
-compiler из bundled ScopeCppSDK и headers из официального Microsoft
-MAPIStubLibrary, скачанные во временную директорию; готовый проверенный бинарник
-лежит в `build-direct\NativeMapiProbe.exe`.
+compiler из bundled ScopeCppSDK и зафиксированные в репозитории headers из
+официального Microsoft MAPIStubLibrary. Готовый проверенный бинарник лежит в
+`build-direct\NativeMapiProbe.exe`.
 
 ## Ограничения prototype
 

@@ -5,89 +5,6 @@ using System.Runtime.Serialization;
 namespace RAGSearch
 {
     [DataContract]
-    internal sealed class AttachmentPayload
-    {
-        [DataMember(Name = "name")]
-        public string name { get; set; }
-        [DataMember(Name = "size")]
-        public long size { get; set; }
-        [DataMember(Name = "content_type")]
-        public string content_type { get; set; }
-        [DataMember(Name = "temp_path")]
-        public string temp_path { get; set; }
-    }
-
-    [DataContract]
-    internal sealed class MessagePayload
-    {
-        [DataMember(Name = "entry_id")]
-        public string entry_id { get; set; }
-        [DataMember(Name = "store_id")]
-        public string store_id { get; set; }
-        [DataMember(Name = "folder_entry_id")]
-        public string folder_entry_id { get; set; }
-        [DataMember(Name = "folder_path")]
-        public string folder_path { get; set; }
-        [DataMember(Name = "store_name")]
-        public string store_name { get; set; }
-        [DataMember(Name = "subject")]
-        public string subject { get; set; }
-        [DataMember(Name = "sender_name")]
-        public string sender_name { get; set; }
-        [DataMember(Name = "sender_email")]
-        public string sender_email { get; set; }
-        [DataMember(Name = "to")]
-        public string to { get; set; }
-        [DataMember(Name = "cc")]
-        public string cc { get; set; }
-        [DataMember(Name = "sent_at")]
-        public string sent_at { get; set; }
-        [DataMember(Name = "received_at")]
-        public string received_at { get; set; }
-        [DataMember(Name = "modified_at")]
-        public string modified_at { get; set; }
-        [DataMember(Name = "internet_message_id")]
-        public string internet_message_id { get; set; }
-        [DataMember(Name = "conversation_id")]
-        public string conversation_id { get; set; }
-        [DataMember(Name = "body")]
-        public string body { get; set; }
-        [DataMember(Name = "attachments")]
-        public List<AttachmentPayload> attachments { get; set; }
-    }
-
-    [DataContract]
-    internal sealed class IngestRequest
-    {
-        [DataMember(Name = "messages")]
-        public List<MessagePayload> messages { get; set; }
-    }
-
-    [DataContract]
-    internal sealed class IngestResponse
-    {
-        [DataMember(Name = "accepted")]
-        public int accepted { get; set; }
-        [DataMember(Name = "failed")]
-        public int failed { get; set; }
-        [DataMember(Name = "errors")]
-        public List<IngestErrorDto> errors { get; set; }
-    }
-
-    [DataContract]
-    internal sealed class IngestErrorDto
-    {
-        [DataMember(Name = "index")]
-        public int index { get; set; }
-        [DataMember(Name = "error")]
-        public string error { get; set; }
-        [DataMember(Name = "entry_id")]
-        public string entry_id { get; set; }
-        [DataMember(Name = "store_id")]
-        public string store_id { get; set; }
-    }
-
-    [DataContract]
     internal sealed class SearchRequest
     {
         [DataMember(Name = "query")]
@@ -218,13 +135,4 @@ namespace RAGSearch
         public string database { get; set; }
     }
 
-    internal sealed class IndexProgress
-    {
-        public int Processed { get; set; }
-        public int EstimatedTotal { get; set; }
-        public int Failed { get; set; }
-        public string CurrentFolder { get; set; }
-        public string Status { get; set; }
-        public bool IsRunning { get; set; }
-    }
 }
