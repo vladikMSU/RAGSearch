@@ -201,7 +201,6 @@
     <Compile Include="LocalServiceClient.cs" />
     <Compile Include="Models.cs" />
     <Compile Include="NativeImportRunner.cs" />
-    <Compile Include="NativeSearchPresenter.cs" />
     <Compile Include="OomGuardProbe.cs" />
     <Compile Include="SearchPaneControl.cs">
       <SubType>UserControl</SubType>

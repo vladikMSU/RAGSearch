@@ -103,7 +103,12 @@ namespace RAGSearch
                 }
             }
 
-            var tools = WorkspaceTools.Find();
+            if (await IsServiceHealthyAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return;
+            }
+
+            var tools = WorkspaceTools.FindForService();
             await EnsureServiceAsync(tools, cancellationToken).ConfigureAwait(false);
         }
 
@@ -644,6 +649,16 @@ namespace RAGSearch
 
             public static WorkspaceTools Find()
             {
+                return Find(false);
+            }
+
+            public static WorkspaceTools FindForService()
+            {
+                return Find(true);
+            }
+
+            private static WorkspaceTools Find(bool serviceOnly)
+            {
                 var assemblyPath = typeof(NativeImportRunner).Assembly.Location;
                 var startingDirectories = new List<string>();
                 AddCandidate(startingDirectories, Environment.GetEnvironmentVariable("RAGSEARCH_WORKSPACE"));
@@ -670,7 +685,9 @@ namespace RAGSearch
                             "native-mapi-probe",
                             "build-direct",
                             "NativeMapiProbe.exe");
-                        var missing = MissingTool(python, service, adapter, native);
+                        var missing = serviceOnly
+                            ? MissingTool(python, service)
+                            : MissingTool(python, service, adapter, native);
                         if (missing != null)
                         {
                             throw new FileNotFoundException(

@@ -2,17 +2,17 @@
 
 Экспериментальный локальный поиск по почте, совместимый с classic Microsoft Outlook
 для Windows x64.
-VSTO-надстройка показывает панель поиска, отдельный C++ worker читает настроенный
-Outlook profile через read-only Extended MAPI, а Python-сервис индексирует письма
-и вложения в SQLite/FTS5.
+VSTO-надстройка показывает собственную нижнюю WinForms-панель поиска и результатов,
+отдельный C++ worker читает настроенный Outlook profile через read-only Extended
+MAPI, а Python-сервис индексирует письма и вложения в SQLite/FTS5. Штатные строка
+поиска и список писем Outlook при этом не изменяются.
 
 ```text
-classic Outlook + VSTO UI
-          │
-          ▼
-C++ Extended MAPI reader ──JSONL──► Python adapter ──HTTP──► Python search service
-          ▲                                                       │
-          └──────── Outlook profile/providers          SQLite + FTS5 + embeddings
+classic Outlook + нижняя VSTO-панель ◄──HTTP──► Python search service ◄──HTTP── Python adapter ◄──JSONL── C++ Extended MAPI reader
+          │                                      │                                                       ▲
+          │ двойной щелчок: StoreID + EntryID    ▼                                                       │
+          ▼                                SQLite + FTS5 + embeddings                         Outlook profile/providers
+   исходное письмо
 ```
 
 Extended MAPI здесь не является скачанным Python-пакетом. Во время сборки
@@ -105,6 +105,13 @@ Python-сервис можно запустить вручную:
 `service\.venv\Scripts\python.exe`; при отсутствии локальной neural model включается
 воспроизводимый hashing provider без дополнительных зависимостей.
 
+Результаты появляются в закреплённой снизу таблице RAG Search в том же порядке,
+в котором их вернул backend; максимум — 25 писем. Двойной щелчок по строке открывает
+исходный Outlook `MailItem` по точной паре `StoreID + EntryID`. Панель подбирает
+светлую или тёмную WinForms-палитру по системной теме, умеет сворачиваться и
+отделяться в плавающее окно. Обычные Search bar, текущая папка и список Outlook
+остаются без изменений.
+
 Ручной потоковый импорт:
 
 ```powershell
@@ -146,13 +153,16 @@ native x64 compile и native-to-service E2E — PASS.
 - Worker читает stores через Outlook MAPI providers, а не парсит PST/OST как файлы.
 - Индексация пока выполняет полный scan; checkpoints, notifications и tombstones не
   реализованы.
-- Проекция результатов использует Outlook `All Mailboxes` AQS: она может показать
-  дополнительные письма с совпавшей фразой и не сохраняет vector ordering.
+- Если письмо после индексации перемещено или удалено, сохранённая пара
+  `StoreID + EntryID` может перестать открываться; нужно обновить индекс.
+- Список результатов является собственным WinForms UI надстройки, а не нативным
+  списком Outlook; это осознанный выбор ради cross-store выдачи в порядке backend.
 - Локальная neural-конфигурация необязательна и не воспроизводится без отдельно
   выбранных package/model artifacts.
 
 Подробности эксперимента и Outlook Guard:
-[docs/PROTOTYPE_NOTES.md](docs/PROTOTYPE_NOTES.md). Ограничения проекции:
+[docs/PROTOTYPE_NOTES.md](docs/PROTOTYPE_NOTES.md). Выбор способа показа результатов
+и отвергнутый эксперимент с `Explorer.Search`:
 [docs/OUTLOOK_SEARCH_PROJECTION.md](docs/OUTLOOK_SEARCH_PROJECTION.md).
 
 ## Лицензии и внешние компоненты

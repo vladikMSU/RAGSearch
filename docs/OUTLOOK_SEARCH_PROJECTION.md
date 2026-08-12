@@ -1,69 +1,104 @@
-# Агрегированная выдача в Outlook All Mailboxes
+# Собственная cross-store выдача RAGSearch в Outlook
 
-RAGSearch проецирует результаты локального hybrid search в штатный центральный
-список classic Outlook через:
+## Принятое решение
+
+RAGSearch **не проецирует** результаты в штатный список classic Outlook. Ответ
+локального search service показывается в собственном WinForms `DataGridView`
+внутри VSTO Custom Task Pane, закреплённого снизу окна Outlook.
+
+Это важная граница текущей реализации:
+
+- Search bar Outlook не заполняется и не очищается;
+- текущая папка, `Explorer.CurrentView` и центральный список писем не меняются;
+- один список RAG Search может одновременно содержать письма из OST и PST;
+- строки сохраняют порядок, в котором их вернул backend;
+- каждая строка несёт точную пару `StoreID + EntryID`, а не приблизительный AQS.
+
+## Поток запроса и отображения
+
+1. Пользователь вводит запрос в нижней панели и нажимает **«Найти»** или `Enter`.
+2. VSTO отправляет `/v1/search` с `filters: {}` и `limit: 25`. Пустые filters
+   означают весь локальный индекс, а не текущую папку Outlook.
+3. Service возвращает уже ранжированный массив `results`.
+4. `SearchPaneControl.PopulateResults` последовательно добавляет элементы массива
+   в таблицу. Дополнительной клиентской сортировки нет; сортировка колонок
+   пользователем отключена.
+5. Таблица показывает rank, тему с фрагментом, отправителя, дату и путь
+   `store · folder`. Пустой ответ очищает только таблицу RAG Search.
+
+Лимит UI и hard cap API одинаковы — 25 писем. Если backend вернул поле `rank`, оно
+показывается как есть; иначе номер строки вычисляется из позиции результата.
+
+Панель использует отдельные светлую и тёмную WinForms-палитры. Начальная палитра
+выбирается при создании control по Windows `AppsUseLightTheme`; таблица, selection,
+input, buttons и settings menu используют согласованные цвета. Панель можно
+свернуть или отделить в плавающее Custom Task Pane, не затрагивая Outlook view.
+
+Основная реализация:
+
+- [`SearchLimit` и построение UI](../RAGSearch/SearchPaneControl.cs#L14);
+- [`SearchAsync`](../RAGSearch/SearchPaneControl.cs#L632);
+- [`PopulateResults`](../RAGSearch/SearchPaneControl.cs#L733);
+- [нижнее размещение Custom Task Pane](../RAGSearch/ThisAddIn.cs#L58).
+
+## Exact identity и открытие оригинала
+
+Search response возвращает для каждого письма сохранённые при индексации
+`entry_id` и `store_id`. Двойной щелчок по строке или клавиша `Enter` вызывает на
+Outlook UI/STA thread:
+
+```csharp
+session.GetItemFromID(result.entry_id, result.store_id);
+```
+
+Полученный `MailItem` открывается через `Display(false)` в настоящем окне Outlook.
+Так открывается именно выбранная backend-строка, даже если одинаковая тема есть в
+нескольких папках или stores. Реализация находится в
+[`ThisAddIn.OpenSearchResult`](../RAGSearch/ThisAddIn.cs#L115).
+
+Точность относится к состоянию store на момент индексации. Если письмо после этого
+переместили, удалили либо отключили его PST, Outlook может больше не разрешить
+сохранённую пару. Панель показывает ошибку и предлагает обновить индекс.
+
+## Отвергнутый эксперимент: `Explorer.Search`
+
+Предыдущий прототип содержал `NativeSearchPresenter`. Он преобразовывал темы
+backend-результатов в OR из кавыченных фраз и вызывал:
 
 ```csharp
 explorer.Search(finalAqs, Outlook.OlSearchScope.olSearchScopeAllFolders);
 ```
 
-`olSearchScopeAllFolders` означает почтовые папки того же типа во всех stores,
-которые пользователь включил в Outlook `Locations to Search`. На проверенной
-машине один native rowset одновременно содержал письма из Inbox, Sent и PST
-`Archives`. Deleted Items Outlook по умолчанию в эту область не включает.
+Эксперимент подтвердил, что `All Mailboxes` способен собрать native rowset из
+Inbox, Sent и PST `Archives`, но не удовлетворяет требованиям RAG-выдачи:
 
-## Поток запроса
+- по контракту `Explorer.Search` запрос становится виден в Instant Search bar;
+- AQS по тексту темы приблизителен и может вернуть другое письмо или копию;
+- бинарные `StoreID + EntryID` нельзя выразить как поддержанное AQS equality;
+- порядок OR-условий не управляет строками — Outlook сортирует rowset сам;
+- последующий `CurrentView.Filter` не ограничил агрегированную таблицу (в live
+  probe осталось 14/14 строк);
+- AQS property syntax зависела от locale/provider: `System.Subject:=...` на
+  проверенной ru-RU Windows + en-US Outlook вернул пустую выдачу.
 
-`NativeSearchPresenter` привязан к тому же `Explorer`, которому принадлежит task
-pane; после HTTP он не переходит к случайному `Application.ActiveExplorer()`.
+Из-за этих ограничений `NativeSearchPresenter` удалён из production-проекта.
+`Explorer.Search`, `Explorer.ClearSearch` и `View.Filter` больше не входят в поток
+семантического поиска. Это не запасной режим, а завершённый отвергнутый эксперимент.
 
-1. Перед запросом presenter запоминает текущие folder/view и версию состояния
-   Explorer. Предыдущая выдача остаётся на экране до готовности новой, поэтому
-   HTTP-await не мигает исходным Inbox и ошибка сервиса не уничтожает результаты.
-2. VSTO отправляет сервису `filters: {}` и `limit: 12`, поэтому поиск идёт по
-   всему локальному индексу, а не по текущему `folder_entry_id`, и service limit
-   совпадает с максимальным числом Outlook AQS-условий.
-3. После await ответ применяется только если пользователь не сменил folder/view
-   и не взаимодействовал со списком.
-4. Из результатов строится компактный OR: тема каждого результата становится
-   обычной кавыченной фразой, максимум 12 условий
-   и 2400 символов. Повторяющиеся темы дедуплицируются.
-5. Финальный AQS атомарно заменяет предыдущий Instant Search и запускается с
-   `olSearchScopeAllFolders`; кнопка сброса вызывает `Explorer.ClearSearch()` и
-   возвращает обычную папку.
+| Механизм | Несколько stores | Search bar без изменений | Exact identity | Порядок backend |
+|---|---:|---:|---:|---:|
+| `Explorer.Search` / All Mailboxes | да | нет | нет | нет |
+| `View.Filter` | нет, одна папка | да | нет | нет |
+| `AdvancedSearch.Save` / Search Folder | нет, один store | да | приблизительно | нет |
+| Extended MAPI Search Folder | нет, один store | да | да по `PR_RECORD_KEY` | нет |
+| собственный WinForms result list | да | да | да, `StoreID + EntryID` | да |
 
-Пустая service-выдача не вызывает `ClearSearch`, иначе Outlook снова показал бы
-все письма исходной папки. Вместо этого запускается заведомо несуществующая
-sentinel-фраза и агрегированный список остаётся пустым до сброса.
-
-## Почему в Search bar виден запрос
-
-Microsoft определяет `Explorer.Search` как действие, эквивалентное вводу строки
-пользователем в Instant Search UI. У метода нет отдельного results object и нет
-callback завершения. Поэтому одновременно получить поддержанный единый
-cross-store native rowset и скрыть строку поиска через Outlook Object Model
-нельзя.
-
-Проверенный эксперимент с широким All Mailboxes search и последующим
-`CurrentView.Filter` это не обошёл: `View.Filter` сохранился, но агрегированная
-таблица осталась 14/14 строк. Instant Search provider проигнорировал folder-view
-filter. Такой fail-open путь не используется.
-
-Canonical Windows AQS `System.Subject:=...` на ru-RU Windows + en-US classic
-Outlook был синтаксически принят, но вернул 0 строк. Локализованные property
-keywords также оказались нестабильны. Поэтому текущий финальный запрос состоит
-из обычных кавыченных фраз, полученных из subject результатов и соединённых
-документированным `OR`. Он короче
-прежней конструкции `subject/from/received` и реально работает на целевой
-установке.
-
-## Cutoff и literal gate
+## Ranking до UI
 
 Сервис агрегирует лучший chunk на уровне сообщения до top-K. Для фразы он
 объединяет literal FTS hits с semantic candidates, сортирует vector-часть по
 `vector_distance = 1 - cosine_similarity`, применяет model-specific floor и
-adaptive window. API hard cap равен 25 сообщениям; VSTO All Mailboxes projection
-запрашивает 12, чтобы не получить результаты, которые не поместятся в AQS.
+adaptive window. UI не переоценивает score и не переставляет результаты.
 
 Для одиночного слова действует защита от наблюдавшейся патологии multilingual
 embedding model:
@@ -74,34 +109,11 @@ embedding model:
 - prefix/substring включает literal gate и скрывает посторонние dense guesses;
 - если literal hit отсутствует, single-token semantic guess не показывается.
 
-Поэтому `киберспорт`, `кибер` и `спорт` находят индексированное
-`киберспорт`, даже если dense model ставит короткое нерелевантное слово выше.
-Schema v2 автоматически rebuild-ит trigram FTS для существующих chunks; повторно
-читать PST/OST не требуется.
+Поэтому `киберспорт`, `кибер` и `спорт` находят индексированное `киберспорт`, даже
+если dense model ставит короткое нерелевантное слово выше. Schema v2 автоматически
+rebuild-ит trigram FTS для существующих chunks; повторно читать PST/OST не требуется.
 
-## Точность identity и порядок строк
-
-Текущая cross-store AQS-проекция приблизительна. Outlook ищет кавыченную фразу
-по своему индексу, поэтому может показать дополнительные копии/письма с той же
-фразой в теме или теле. Поддержанного Outlook AQS equality по бинарным
-`(StoreID, EntryID)` нет; Internet Message-ID также не имеет документированного
-Instant Search keyword.
-
-Порядок OR-условий не задаёт порядок строк. Backend возвращает `rank`,
-`lexical_match_kind`, `vector_similarity`, `vector_distance` и `hybrid_score`,
-но Outlook сортирует aggregate view по собственному relevance/date. Точный
-vector order возможен только в собственном result list либо после записи custom
-property в письма, чего read-only прототип не делает.
-
-| Механизм | Несколько stores | Пустой Search bar | Exact identity / vector order |
-|---|---:|---:|---:|
-| `Explorer.Search` / All Mailboxes | да | нет | нет / нет |
-| `View.Filter` | нет, одна папка | да | приблизительно / нет |
-| `AdvancedSearch.Save` / Search Folder | нет, один store | да | приблизительно / нет |
-| Extended MAPI Search Folder | нет, один store | да | да по `PR_RECORD_KEY` / нет |
-| собственный result list | да | да | да / да, но не native Outlook list |
-
-## Документация Microsoft
+## Документация Microsoft для проверенного legacy-пути
 
 - [Explorer.Search](https://learn.microsoft.com/en-us/office/vba/api/outlook.explorer.search)
 - [OlSearchScope](https://learn.microsoft.com/en-us/office/vba/api/outlook.olsearchscope)

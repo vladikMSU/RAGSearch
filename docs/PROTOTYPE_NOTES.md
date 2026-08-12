@@ -169,42 +169,75 @@ Service contract:
 
 E2E positive control: отдельный сервис на `127.0.0.1:8877`, 3 PST messages, 39 attachment records, stats `messages=3`, `chunks=6`, owned spool пуст после импорта, exit PASS. Основной full scan дал `messages=42`, `attachments=49`, `chunks=1877`. Флаг `body_truncated` пока не хранится в БД, но adapter считает и показывает такие записи в progress/final summary.
 
-## UI и нативная фильтрация
+## UI и открытие исходных писем
 
 Реализовано:
 
-- top-docked task pane, высота 126 px;
-- query, `Семантический поиск`, `Сбросить фильтр`;
+- нижний VSTO Custom Task Pane с собственной WinForms-таблицей результатов;
+- query, режим `Письма по смыслу`, кнопки `Найти` и очистки локальной выдачи;
+- светлая и тёмная палитры по Windows `AppsUseLightTheme`, включая таблицу,
+  selection, input, buttons и settings menu;
+- responsive command bar, сворачивание нижней панели и отделение её в плавающее
+  Custom Task Pane;
 - production-кнопка `Индексировать PST + OST (MAPI)` запускает full-scan adapter асинхронно без shell/UAC и показывает progress;
 - `Очистить базу` показывает warning с `No` по умолчанию, при необходимости запускает локальный service и через authenticated `DELETE /v1/index` удаляет только сообщения/вложения/чанки/FTS из локального индекса;
 - `Стоп` сначала создаёт уникальный cancellation sentinel, затем ограниченно ждёт graceful shutdown и только после таймаута завершает принадлежащее этому запуску Windows Job tree;
-- отдельная кнопка `Debug OOM: 1 письмо → Guard` немедленно вызывает один protected OOM getter и служит детерминированным negative control;
+- отдельный пункт `Диагностика Outlook Guard` немедленно вызывает один protected OOM getter и служит детерминированным negative control;
 - полный legacy OOM scanner, его extractor/DTO и подписка `NewMailEx` удалены из production-проекта: при старте RAGSearch protected getters не вызываются;
 - при недоступном `/health` надстройка может запустить точный workspace `service\.venv\Scripts\python.exe service\run.py`; уже работающие service processes она не завершает;
-- отдельный result window/DataGrid удалён;
-- `NativeSearchPresenter` вызывает `Explorer.Search(..., olSearchScopeAllFolders)` в привязанном task-pane Explorer и показывает один All Mailboxes rowset из выбранных Outlook stores;
-- сервис получает `filters: {}` и ищет по всему локальному индексу, а не только в текущей папке;
-- `Сбросить фильтр` вызывает `Explorer.ClearSearch()` и возвращает исходную папку.
+- сервис получает `filters: {}` и `limit: 25`, поэтому ищет по всему локальному
+  индексу, а не только в текущей папке;
+- ответ последовательно записывается во встроенный `DataGridView` без клиентской
+  пересортировки: rank, тема и фрагмент, отправитель, дата, store и папка;
+- двойной щелчок по строке или `Enter` открывает настоящий Outlook `MailItem` через
+  `NameSpace.GetItemFromID(entry_id, store_id)` и `Display(false)`;
+- Search bar, текущая папка, `Explorer.CurrentView` и штатный список Outlook не
+  изменяются ни при поиске, ни при очистке таблицы RAG Search.
 
-Предыдущая текущая-folder реализация через `View.Filter` действительно оставляла Search bar пустым, но архитектурно не могла собрать PST и OST в одном списке. Live probe доказал, что широкий `Explorer.Search` даёт Inbox + Sent + PST `Archives`, а попытка наложить на этот aggregate rowset сохранённый `View.Filter` ничего не меняет: таблица осталась 14/14. Поэтому production-прототип использует финальный AQS как единственный поддержанный cross-store restriction.
+Отдельное внешнее result window из раннего прототипа не возвращалось: таблица
+встроена прямо в нижнюю панель. Порядок строк является точным порядком backend,
+а пара `StoreID + EntryID` выбирает точное письмо даже при совпадающих темах в
+разных stores.
 
-Property AQS оказался locale/provider-dependent: canonical `System.Subject:=...` и составные `тема:/откого:/получено:` на целевой ru-RU Windows + en-US Office либо дали 0, либо не распарсились как ожидается. Финальная версия использует короткий OR из обычных кавыченных фраз, полученных из тем результатов. Он приблизителен, но реально работает и заметно понятнее старой технической конструкции.
+### Отвергнутый эксперимент с нативным списком Outlook
 
-Финальный реальный прогон:
+Текущая-folder реализация через `View.Filter` оставляла Search bar пустым, но не
+могла собрать PST и OST в одном списке. Следующий эксперимент с
+`Explorer.Search(..., olSearchScopeAllFolders)` дал общий native rowset из Inbox,
+Sent и PST `Archives`, однако:
+
+- по контракту заполнял видимый Instant Search bar;
+- выбирал письма по приблизительным subject-фразам, а не по `StoreID + EntryID`;
+- отдавал сортировку Outlook и не сохранял vector/backend order;
+- не подчинился последующему `CurrentView.Filter`: live probe остался 14/14 строк;
+- зависел от locale/provider: `System.Subject:=...` и локализованные property
+  keywords на ru-RU Windows + en-US Office работали нестабильно.
+
+Поэтому `NativeSearchPresenter` и его AQS-проекция удалены из production-проекта.
+Это исторический rejected experiment, а не fallback текущей реализации.
+
+Текущий поток поиска:
 
 ```text
 semantic query: дарова
-scope: AllFolders across Outlook stores selected for search
-semantic results: structured result list
-ranking: literal gate, then vector_distance ascending; adaptive cutoff; UI top-12
-native presentation: Explorer.Search(final subject-derived quoted-phrase AQS, olSearchScopeAllFolders)
-projection identity: approximate quoted phrases derived from result subjects
-Search bar: generated query is visible by Outlook contract
+scope: all messages in the local RAGSearch index; filters={}
+ranking: literal gate, then vector_distance ascending; adaptive cutoff; UI top-25
+presentation: bottom WinForms DataGridView in backend order
+identity: exact StoreID + EntryID from each backend result
+open: double-click/Enter -> NameSpace.GetItemFromID -> MailItem.Display(false)
+native Outlook Search bar/list/current folder: unchanged
 ```
 
-Финальный clean UI control выполнен после `Deny` в отдельном startup Guard: production-кнопка панели породила adapter/native process tree, закончила статусом `Native-индексация завершена: 42 писем` и не вызвала нового warning. После upsert основная БД сохранила `messages=42`, `attachments=49`, `chunks=1877`, `PRAGMA integrity_check=ok`; marker-owned native spool directories — 0.
+Clean ingestion control после `Deny` в отдельном startup Guard: production-кнопка
+панели породила adapter/native process tree, закончила статусом
+`Native-индексация завершена: 42 писем` и не вызвала нового warning. После upsert
+основная БД сохранила `messages=42`, `attachments=49`, `chunks=1877`,
+`PRAGMA integrity_check=ok`; marker-owned native spool directories — 0.
 
-Ограничение: `Explorer.Search` неизбежно использует видимый Instant Search UI, кавыченная subject-фраза не является exact `(StoreID, EntryID)`, а native view не сортирует по внешнему SQLite vector distance. Extended MAPI Search Folder может дать exact `PR_RECORD_KEY`, но только отдельно для каждого OST/PST store; для единого cross-store списка в точном vector-порядке нужен собственный result list. Подробности: [OUTLOOK_SEARCH_PROJECTION.md](OUTLOOK_SEARCH_PROJECTION.md).
+Ограничение текущего locator: если письмо после индексации переместили, удалили или
+отключили его store, сохранённая пара может перестать разрешаться; панель сообщает
+об ошибке и предлагает обновить индекс. Подробности выбора собственного списка и
+история `Explorer.Search`: [OUTLOOK_SEARCH_PROJECTION.md](OUTLOOK_SEARCH_PROJECTION.md).
 
 ## Проверки кода
 
@@ -222,7 +255,8 @@ Standard MSBuild native-проекта сейчас блокируется от�
 
 1. Native x64 MAPI worker выполняет initial PST + cached Exchange scan и incremental reconciliation/notifications.
 2. Python service извлекает attachments, чанкует внутри сущностей, считает FTS/embeddings и хранит identity/metadata.
-3. VSTO отвечает только за верхнюю UI-панель, native Outlook filtering/navigation и жизненный цикл локального service.
+3. VSTO отвечает только за нижнюю собственную UI-панель, открытие Outlook-оригинала
+   по locator и жизненный цикл локального service.
 4. Graph может дополнять Exchange Online history за пределами OST cache; PST через Graph недоступны.
 5. Object Model Guard и корпоративные политики остаются включены.
 
@@ -232,7 +266,8 @@ Standard MSBuild native-проекта сейчас блокируется от�
 
 - incremental MAPI notifications/checkpoints вместо полного повторного scan;
 - durable checkpoints, tombstones, move/delete reconciliation и stable identity (`PR_SEARCH_KEY`/InternetMessageID/content hash);
-- exact MAPI Search Folder projection либо явно принять subject-phrase approximation;
+- reconciliation locator после move/delete и понятное восстановление stale
+  `StoreID + EntryID`;
 - ANN index для больших архивов;
 - sandbox/timeouts/AV для PDF, Office, OCR и архивов;
 - шифрование БД/секретов, ACL, DLP, retention и audit;

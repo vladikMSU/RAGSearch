@@ -1,31 +1,54 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace RAGSearch
 {
     internal sealed class SearchPaneControl : UserControl
     {
+        private const int SearchLimit = 25;
+        private const int EmSetCueBanner = 0x1501;
+
         private readonly LocalServiceClient serviceClient;
         private readonly OomGuardProbe oomGuardProbe;
         private readonly NativeImportRunner nativeImportRunner;
-        private readonly Func<NativeFolderScope> getNativeSearchScope;
-        private readonly Func<NativeFolderScope, IList<SearchResultDto>, NativeFilterSummary> showNativeResults;
-        private readonly Action clearNativeSearch;
+        private readonly Action<SearchResultDto> openSearchResult;
+        private readonly Action<bool> setPaneCollapsed;
+        private readonly Func<bool> togglePaneFloating;
+        private readonly PanePalette palette;
+        private readonly TableLayoutPanel rootLayout;
+        private readonly Panel commandBar;
+        private readonly Label modeLabel;
         private readonly TextBox queryBox;
         private readonly Button searchButton;
         private readonly Button clearButton;
-        private readonly Button indexButton;
-        private readonly Button stopButton;
-        private readonly Button resetIndexButton;
-        private readonly Button debugOomButton;
+        private readonly Button collapseButton;
+        private readonly Button detachButton;
+        private readonly Button settingsButton;
+        private readonly DataGridView resultsGrid;
         private readonly Label statusLabel;
+        private readonly ContextMenuStrip settingsMenu;
+        private readonly ToolStripMenuItem collapsePaneMenuButton;
+        private readonly ToolStripMenuItem detachPaneMenuButton;
+        private readonly ToolStripMenuItem indexButton;
+        private readonly ToolStripMenuItem stopButton;
+        private readonly ToolStripMenuItem resetIndexButton;
+        private readonly ToolStripMenuItem debugOomButton;
+        private readonly List<Font> ownedFonts = new List<Font>();
+        private readonly Font subjectFont;
         private CancellationTokenSource searchCancellation;
         private CancellationTokenSource resetCancellation;
         private int searchGeneration;
+        private string emptyStateText;
+        private bool adjustingColumnWidths;
+        private bool columnWidthsCustomized;
+        private bool paneFloating;
+        private bool paneCollapsed;
         private bool probeRunning;
         private bool resetRunning;
 
@@ -33,87 +56,161 @@ namespace RAGSearch
             LocalServiceClient serviceClient,
             OomGuardProbe oomGuardProbe,
             NativeImportRunner nativeImportRunner,
-            Func<NativeFolderScope> getNativeSearchScope,
-            Func<NativeFolderScope, IList<SearchResultDto>, NativeFilterSummary> showNativeResults,
-            Action clearNativeSearch)
+            Action<SearchResultDto> openSearchResult,
+            Action<bool> setPaneCollapsed,
+            Func<bool> togglePaneFloating)
         {
             this.serviceClient = serviceClient ?? throw new ArgumentNullException("serviceClient");
             this.oomGuardProbe = oomGuardProbe ?? throw new ArgumentNullException("oomGuardProbe");
             this.nativeImportRunner = nativeImportRunner ?? throw new ArgumentNullException("nativeImportRunner");
-            this.getNativeSearchScope = getNativeSearchScope ?? throw new ArgumentNullException("getNativeSearchScope");
-            this.showNativeResults = showNativeResults ?? throw new ArgumentNullException("showNativeResults");
-            this.clearNativeSearch = clearNativeSearch ?? throw new ArgumentNullException("clearNativeSearch");
+            this.openSearchResult = openSearchResult ?? throw new ArgumentNullException("openSearchResult");
+            this.setPaneCollapsed = setPaneCollapsed ?? throw new ArgumentNullException("setPaneCollapsed");
+            this.togglePaneFloating = togglePaneFloating ?? throw new ArgumentNullException("togglePaneFloating");
 
+            AutoScaleMode = AutoScaleMode.Dpi;
+            palette = PanePalette.Create();
             Dock = DockStyle.Fill;
-            BackColor = SystemColors.Window;
-            MinimumSize = new Size(600, 96);
+            BackColor = palette.Background;
+            Font = OwnFont(new Font("Segoe UI", 9F));
+            MinimumSize = new Size(420, 40);
+            subjectFont = OwnFont(new Font("Segoe UI Semibold", 8.5F, FontStyle.Bold));
+            emptyStateText = "Введите запрос, чтобы найти письма по смыслу.";
 
             queryBox = new TextBox
             {
-                Width = 520,
-                Font = new Font("Segoe UI", 10F),
-                Margin = new Padding(8, 7, 5, 3)
+                BackColor = palette.InputBackground,
+                AutoSize = false,
+                BorderStyle = BorderStyle.FixedSingle,
+                Dock = DockStyle.None,
+                Font = OwnFont(new Font("Segoe UI", 9.5F)),
+                ForeColor = palette.Text,
+                Margin = new Padding(0),
+                TabIndex = 0
             };
+            queryBox.HandleCreated += (sender, args) => SetCueBanner(
+                queryBox,
+                "Опишите, что обсуждали в письмах...");
             queryBox.KeyDown += QueryBoxOnKeyDown;
 
-            searchButton = CreateButton("Семантический поиск");
+            searchButton = CreatePrimaryButton("Найти");
+            searchButton.TabIndex = 1;
             searchButton.Click += SearchButtonOnClick;
 
-            clearButton = CreateButton("Сбросить фильтр");
+            clearButton = CreateCommandButton("×");
+            clearButton.AccessibleName = "Очистить запрос и результаты";
+            clearButton.Font = OwnFont(new Font("Segoe UI", 12F));
+            clearButton.TabIndex = 2;
             clearButton.Click += ClearButtonOnClick;
 
-            indexButton = CreateButton("Индексировать PST + OST (MAPI)");
+            collapseButton = CreateCommandButton("Свернуть");
+            collapseButton.TabIndex = 3;
+            collapseButton.Click += CollapseButtonOnClick;
+
+            detachButton = CreateCommandButton("Отделить");
+            detachButton.TabIndex = 4;
+            detachButton.Click += DetachButtonOnClick;
+
+            settingsButton = CreateCommandButton("⚙");
+            settingsButton.AccessibleName = "Настройки RAG Search";
+            settingsButton.Font = OwnFont(new Font("Segoe UI Symbol", 10F));
+            settingsButton.MinimumSize = new Size(32, 26);
+            settingsButton.TabIndex = 5;
+
+            settingsMenu = new ContextMenuStrip
+            {
+                BackColor = palette.Surface,
+                Font = OwnFont(new Font("Segoe UI", 9F)),
+                ForeColor = palette.Text,
+                ShowImageMargin = false
+            };
+            if (palette.IsDark)
+            {
+                settingsMenu.Renderer = new ToolStripProfessionalRenderer(
+                    new DarkMenuColorTable(palette));
+            }
+            collapsePaneMenuButton = new ToolStripMenuItem("Свернуть панель");
+            collapsePaneMenuButton.Click += CollapseButtonOnClick;
+            detachPaneMenuButton = new ToolStripMenuItem("Отделить панель");
+            detachPaneMenuButton.Click += DetachButtonOnClick;
+            indexButton = new ToolStripMenuItem("Индексировать PST + OST (MAPI)");
             indexButton.Click += IndexButtonOnClick;
-
-            stopButton = CreateButton("Стоп");
-            stopButton.Enabled = false;
+            stopButton = new ToolStripMenuItem("Остановить индексацию")
+            {
+                Enabled = false
+            };
             stopButton.Click += StopButtonOnClick;
-
-            resetIndexButton = CreateButton("Очистить базу");
+            resetIndexButton = new ToolStripMenuItem("Очистить локальный индекс...");
             resetIndexButton.Click += ResetIndexButtonOnClick;
-
-            debugOomButton = CreateButton("Debug OOM: 1 письмо → Guard");
+            debugOomButton = new ToolStripMenuItem("Диагностика Outlook Guard");
             debugOomButton.Click += DebugOomButtonOnClick;
+            settingsMenu.Items.Add(collapsePaneMenuButton);
+            settingsMenu.Items.Add(detachPaneMenuButton);
+            settingsMenu.Items.Add(new ToolStripSeparator());
+            settingsMenu.Items.Add(indexButton);
+            settingsMenu.Items.Add(stopButton);
+            settingsMenu.Items.Add(new ToolStripSeparator());
+            settingsMenu.Items.Add(resetIndexButton);
+            settingsMenu.Items.Add(new ToolStripSeparator());
+            settingsMenu.Items.Add(debugOomButton);
+            foreach (ToolStripItem item in settingsMenu.Items)
+            {
+                item.BackColor = palette.Surface;
+                item.ForeColor = palette.Text;
+            }
+            settingsButton.Click += SettingsButtonOnClick;
+
+            resultsGrid = CreateResultsGrid();
+            resultsGrid.CellDoubleClick += ResultsGridOnCellDoubleClick;
+            resultsGrid.CellPainting += ResultsGridOnCellPainting;
+            resultsGrid.KeyDown += ResultsGridOnKeyDown;
+            resultsGrid.Paint += ResultsGridOnPaint;
+            resultsGrid.ClientSizeChanged += ResultsGridOnClientSizeChanged;
+            resultsGrid.ColumnWidthChanged += ResultsGridOnColumnWidthChanged;
 
             statusLabel = new Label
             {
                 AutoEllipsis = true,
+                BackColor = palette.Background,
                 Dock = DockStyle.Fill,
-                Font = new Font("Segoe UI", 8.5F),
-                ForeColor = SystemColors.GrayText,
+                Font = OwnFont(new Font("Segoe UI", 8.5F)),
+                ForeColor = palette.MutedText,
                 Padding = new Padding(8, 2, 4, 0),
-                Text = "Локальный сервис: проверка..."
+                Text = "Локальный сервис: проверка...",
+                TextAlign = ContentAlignment.MiddleLeft
             };
 
-            var searchRow = CreateRow();
-            searchRow.Controls.Add(queryBox);
-            searchRow.Controls.Add(searchButton);
-            searchRow.Controls.Add(clearButton);
+            commandBar = CreateCommandBar();
+            modeLabel = CreateModeLabel("Письма по смыслу");
+            commandBar.Controls.Add(modeLabel);
+            commandBar.Controls.Add(queryBox);
+            commandBar.Controls.Add(searchButton);
+            commandBar.Controls.Add(clearButton);
+            commandBar.Controls.Add(collapseButton);
+            commandBar.Controls.Add(detachButton);
+            commandBar.Controls.Add(settingsButton);
+            commandBar.Layout += CommandBarOnLayout;
 
-            var toolsRow = CreateRow();
-            toolsRow.Controls.Add(indexButton);
-            toolsRow.Controls.Add(stopButton);
-            toolsRow.Controls.Add(resetIndexButton);
-            toolsRow.Controls.Add(debugOomButton);
-
-            var layout = new TableLayoutPanel
+            rootLayout = new TableLayoutPanel
             {
-                Dock = DockStyle.Fill,
+                BackColor = palette.Background,
                 ColumnCount = 1,
-                RowCount = 3,
+                Dock = DockStyle.Fill,
                 Margin = new Padding(0),
-                // Current Microsoft 365 builds draw the vertical app rail over the
-                // left edge of a top task pane. Keep controls out from under it.
-                Padding = new Padding(52, 0, 0, 0)
+                Padding = new Padding(52, 0, 0, 0),
+                RowCount = 3
             };
-            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32F));
-            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            layout.Controls.Add(searchRow, 0, 0);
-            layout.Controls.Add(toolsRow, 0, 1);
-            layout.Controls.Add(statusLabel, 0, 2);
-            Controls.Add(layout);
+            rootLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44F));
+            rootLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            rootLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 24F));
+            rootLayout.Controls.Add(commandBar, 0, 0);
+            rootLayout.Controls.Add(resultsGrid, 0, 1);
+            rootLayout.Controls.Add(statusLabel, 0, 2);
+            Controls.Add(rootLayout);
+
+            ApplyScaledMetrics();
+            HandleCreated += (sender, args) => ApplyScaledMetrics();
+            DpiChangedAfterParent += (sender, args) => ApplyScaledMetrics();
 
             nativeImportRunner.ProgressChanged += NativeImportRunnerOnProgressChanged;
             Load += async (sender, args) =>
@@ -132,31 +229,528 @@ namespace RAGSearch
             };
         }
 
-        private static FlowLayoutPanel CreateRow()
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr SendMessage(
+            IntPtr windowHandle,
+            int message,
+            IntPtr wordParameter,
+            string longParameter);
+
+        private static void SetCueBanner(TextBox textBox, string cueText)
         {
-            return new FlowLayoutPanel
+            if (textBox == null || textBox.IsDisposed || !textBox.IsHandleCreated)
             {
+                return;
+            }
+
+            SendMessage(textBox.Handle, EmSetCueBanner, IntPtr.Zero, cueText);
+        }
+
+        internal int CollapsedClientHeight
+        {
+            get { return ScaleLogical(44); }
+        }
+
+        internal int MinimumExpandedClientHeight
+        {
+            get { return ScaleLogical(220); }
+        }
+
+        internal void SetPaneFloating(bool floating)
+        {
+            paneFloating = floating;
+            rootLayout.Padding = new Padding(floating ? 0 : ScaleLogical(52), 0, 0, 0);
+            detachButton.Text = floating ? "Прикрепить" : "Отделить";
+            detachPaneMenuButton.Text = floating
+                ? "Прикрепить панель снизу"
+                : "Отделить панель";
+            commandBar.PerformLayout();
+        }
+
+        private Panel CreateCommandBar()
+        {
+            return new Panel
+            {
+                BackColor = palette.Surface,
                 Dock = DockStyle.Fill,
-                AutoSize = false,
-                FlowDirection = FlowDirection.LeftToRight,
-                WrapContents = false,
-                BackColor = SystemColors.ControlLightLight,
+                Margin = new Padding(0),
                 Padding = new Padding(0)
             };
         }
 
-        private static Button CreateButton(string text)
+        private Label CreateModeLabel(string text)
         {
-            return new Button
+            return new Label
             {
-                AutoSize = true,
-                FlatStyle = FlatStyle.System,
-                Font = new Font("Segoe UI", 9F),
-                Margin = new Padding(3, 5, 3, 3),
-                Padding = new Padding(5, 1, 5, 1),
+                AutoEllipsis = true,
+                BackColor = palette.ChipBackground,
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = OwnFont(new Font("Segoe UI Semibold", 8.5F, FontStyle.Bold)),
+                ForeColor = palette.ChipText,
+                Margin = new Padding(0),
                 Text = text,
-                UseVisualStyleBackColor = true
+                TextAlign = ContentAlignment.MiddleCenter
             };
+        }
+
+        private Button CreateCommandButton(string text)
+        {
+            var button = new Button
+            {
+                AutoSize = false,
+                BackColor = palette.ButtonBackground,
+                FlatStyle = FlatStyle.Flat,
+                ForeColor = palette.Text,
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                Text = text,
+                UseVisualStyleBackColor = false
+            };
+            button.FlatAppearance.BorderColor = palette.Border;
+            button.FlatAppearance.MouseDownBackColor = palette.ButtonPressed;
+            button.FlatAppearance.MouseOverBackColor = palette.ButtonHover;
+            return button;
+        }
+
+        private Button CreatePrimaryButton(string text)
+        {
+            var button = CreateCommandButton(text);
+            button.BackColor = palette.Accent;
+            button.FlatAppearance.BorderColor = palette.AccentBorder;
+            button.FlatAppearance.MouseDownBackColor = palette.AccentPressed;
+            button.FlatAppearance.MouseOverBackColor = palette.AccentHover;
+            button.ForeColor = Color.White;
+            return button;
+        }
+
+        private DataGridView CreateResultsGrid()
+        {
+            var grid = new DataGridView
+            {
+                AllowUserToAddRows = false,
+                AllowUserToDeleteRows = false,
+                AllowUserToOrderColumns = false,
+                AllowUserToResizeRows = false,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None,
+                AutoGenerateColumns = false,
+                BackgroundColor = palette.Background,
+                BorderStyle = BorderStyle.None,
+                CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
+                ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText,
+                ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single,
+                ColumnHeadersHeight = 25,
+                ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing,
+                Dock = DockStyle.Fill,
+                EditMode = DataGridViewEditMode.EditProgrammatically,
+                EnableHeadersVisualStyles = false,
+                GridColor = palette.Border,
+                Margin = new Padding(0),
+                MultiSelect = false,
+                ReadOnly = true,
+                RowHeadersVisible = false,
+                RowTemplate = { Height = 25 },
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                ShowCellErrors = false,
+                ShowCellToolTips = true,
+                ShowEditingIcon = false
+            };
+            grid.ColumnHeadersDefaultCellStyle.BackColor = palette.HeaderBackground;
+            grid.ColumnHeadersDefaultCellStyle.ForeColor = palette.Text;
+            grid.ColumnHeadersDefaultCellStyle.Font = OwnFont(new Font("Segoe UI", 8.5F));
+            grid.ColumnHeadersDefaultCellStyle.Padding = new Padding(5, 0, 5, 0);
+            grid.DefaultCellStyle.BackColor = palette.Background;
+            grid.DefaultCellStyle.ForeColor = palette.Text;
+            grid.DefaultCellStyle.Font = OwnFont(new Font("Segoe UI", 8.5F));
+            grid.DefaultCellStyle.Padding = new Padding(4, 0, 4, 0);
+            grid.DefaultCellStyle.SelectionBackColor = palette.Selection;
+            grid.DefaultCellStyle.SelectionForeColor = palette.SelectionText;
+            grid.AlternatingRowsDefaultCellStyle.BackColor = palette.AlternateBackground;
+
+            grid.Columns.Add(CreateTextColumn("Rank", "#", 36));
+            grid.Columns["Rank"].Resizable = DataGridViewTriState.False;
+            grid.Columns.Add(new DataGridViewTextBoxColumn
+            {
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.None,
+                HeaderText = "Тема письма и фрагмент",
+                MinimumWidth = 220,
+                Name = "SubjectAndSnippet",
+                ReadOnly = true,
+                SortMode = DataGridViewColumnSortMode.NotSortable,
+                Width = 720
+            });
+            grid.Columns.Add(CreateTextColumn("Sender", "Отправитель", 150));
+            grid.Columns.Add(CreateTextColumn("Received", "Дата", 118));
+            var folderColumn = CreateTextColumn("Folder", "Хранилище / папка", 190);
+            folderColumn.AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill;
+            folderColumn.FillWeight = 100F;
+            folderColumn.MinimumWidth = 190;
+            folderColumn.Resizable = DataGridViewTriState.False;
+            grid.Columns.Add(folderColumn);
+            return grid;
+        }
+
+        private static DataGridViewTextBoxColumn CreateTextColumn(
+            string name,
+            string header,
+            int width)
+        {
+            return new DataGridViewTextBoxColumn
+            {
+                HeaderText = header,
+                Name = name,
+                ReadOnly = true,
+                SortMode = DataGridViewColumnSortMode.NotSortable,
+                Width = width
+            };
+        }
+
+        private void CommandBarOnLayout(object sender, LayoutEventArgs eventArgs)
+        {
+            var width = commandBar.ClientSize.Width;
+            var height = commandBar.ClientSize.Height;
+            if (width <= 0 || height <= 0)
+            {
+                return;
+            }
+
+            var padding = ScaleLogical(10);
+            var gap = ScaleLogical(6);
+            var controlHeight = ScaleLogical(28);
+            var top = Math.Max(0, (height - controlHeight) / 2);
+            var right = width - padding;
+
+            var gearWidth = ScaleLogical(34);
+            settingsButton.SetBounds(right - gearWidth, top, gearWidth, controlHeight);
+            right = settingsButton.Left - gap;
+
+            collapseButton.Visible = !paneFloating;
+            var showUtilityActions = width >= ScaleLogical(720);
+            var showTextActions = width >= ScaleLogical(1040);
+            detachButton.Visible = showUtilityActions;
+            if (showUtilityActions)
+            {
+                var utilityWidth = showTextActions ? ScaleLogical(88) : ScaleLogical(34);
+                detachButton.Text = showTextActions
+                    ? (paneFloating ? "Прикрепить" : "Отделить")
+                    : (paneFloating ? "↙" : "↗");
+                detachButton.AccessibleName = paneFloating
+                    ? "Прикрепить панель снизу"
+                    : "Отделить панель";
+                detachButton.SetBounds(
+                    right - utilityWidth,
+                    top,
+                    utilityWidth,
+                    controlHeight);
+                right = detachButton.Left - gap;
+
+                if (!paneFloating)
+                {
+                    collapseButton.Text = showTextActions
+                        ? (paneCollapsed ? "Развернуть" : "Свернуть")
+                        : (paneCollapsed ? "⌄" : "—");
+                    collapseButton.AccessibleName = paneCollapsed
+                        ? "Развернуть панель"
+                        : "Свернуть панель";
+                    collapseButton.SetBounds(
+                        right - utilityWidth,
+                        top,
+                        utilityWidth,
+                        controlHeight);
+                    right = collapseButton.Left - ScaleLogical(12);
+                }
+            }
+
+            var left = padding;
+            var showMode = width >= ScaleLogical(940);
+            modeLabel.Visible = showMode;
+            if (showMode)
+            {
+                var modeWidth = ScaleLogical(142);
+                modeLabel.SetBounds(left, top, modeWidth, controlHeight);
+                left = modeLabel.Right + ScaleLogical(12);
+            }
+
+            var searchWidth = ScaleLogical(76);
+            var clearWidth = ScaleLogical(30);
+            var maximumQueryWidth = ScaleLogical(700);
+            var availableForQuery = right - left - searchWidth - clearWidth - (gap * 2);
+            if (availableForQuery < ScaleLogical(180) && showMode)
+            {
+                modeLabel.Visible = false;
+                left = padding;
+                availableForQuery = right - left - searchWidth - clearWidth - (gap * 2);
+            }
+
+            var queryWidth = Math.Max(
+                ScaleLogical(90),
+                Math.Min(maximumQueryWidth, availableForQuery));
+            queryBox.SetBounds(left, top, queryWidth, controlHeight);
+            searchButton.SetBounds(
+                queryBox.Right + gap,
+                top,
+                searchWidth,
+                controlHeight);
+            clearButton.SetBounds(
+                searchButton.Right + gap,
+                top,
+                clearWidth,
+                controlHeight);
+        }
+
+        private void ApplyScaledMetrics()
+        {
+            rootLayout.Padding = new Padding(
+                paneFloating ? 0 : ScaleLogical(52),
+                0,
+                0,
+                0);
+            rootLayout.RowStyles[0].Height = ScaleLogical(44);
+            rootLayout.RowStyles[2].Height = paneCollapsed ? 0 : ScaleLogical(24);
+            resultsGrid.ColumnHeadersHeight = ScaleLogical(27);
+            var rowHeight = ScaleLogical(27);
+            resultsGrid.RowTemplate.Height = rowHeight;
+            foreach (DataGridViewRow row in resultsGrid.Rows)
+            {
+                row.Height = rowHeight;
+            }
+            adjustingColumnWidths = true;
+            try
+            {
+                resultsGrid.Columns["Rank"].Width = ScaleLogical(36);
+                resultsGrid.Columns["SubjectAndSnippet"].MinimumWidth = ScaleLogical(220);
+                resultsGrid.Columns["Sender"].MinimumWidth = ScaleLogical(90);
+                resultsGrid.Columns["Sender"].Width = ScaleLogical(150);
+                resultsGrid.Columns["Received"].MinimumWidth = ScaleLogical(90);
+                resultsGrid.Columns["Received"].Width = ScaleLogical(118);
+                resultsGrid.Columns["Folder"].MinimumWidth = ScaleLogical(190);
+            }
+            finally
+            {
+                adjustingColumnWidths = false;
+            }
+            FitColumnsToViewport(null);
+            commandBar.PerformLayout();
+            resultsGrid.Invalidate();
+        }
+
+        private void ResultsGridOnClientSizeChanged(object sender, EventArgs eventArgs)
+        {
+            FitColumnsToViewport(null);
+        }
+
+        private void ResultsGridOnColumnWidthChanged(
+            object sender,
+            DataGridViewColumnEventArgs eventArgs)
+        {
+            if (adjustingColumnWidths ||
+                eventArgs.Column == null ||
+                eventArgs.Column.AutoSizeMode == DataGridViewAutoSizeColumnMode.Fill ||
+                eventArgs.Column.Name == "Rank")
+            {
+                return;
+            }
+
+            columnWidthsCustomized = true;
+            FitColumnsToViewport(eventArgs.Column);
+        }
+
+        private void FitColumnsToViewport(DataGridViewColumn preferredColumn)
+        {
+            if (resultsGrid == null ||
+                resultsGrid.IsDisposed ||
+                resultsGrid.ClientSize.Width <= 0 ||
+                adjustingColumnWidths)
+            {
+                return;
+            }
+
+            var rankColumn = resultsGrid.Columns["Rank"];
+            var subjectColumn = resultsGrid.Columns["SubjectAndSnippet"];
+            var senderColumn = resultsGrid.Columns["Sender"];
+            var receivedColumn = resultsGrid.Columns["Received"];
+            var folderColumn = resultsGrid.Columns["Folder"];
+            var maximumFixedWidth = resultsGrid.ClientSize.Width -
+                                    folderColumn.MinimumWidth -
+                                    SystemInformation.VerticalScrollBarWidth -
+                                    ScaleLogical(2);
+            if (maximumFixedWidth <= 0)
+            {
+                return;
+            }
+
+            adjustingColumnWidths = true;
+            try
+            {
+                if (!columnWidthsCustomized)
+                {
+                    senderColumn.Width = ScaleLogical(150);
+                    receivedColumn.Width = ScaleLogical(118);
+                    var maximumSubjectWidth = maximumFixedWidth -
+                                              rankColumn.Width -
+                                              senderColumn.Width -
+                                              receivedColumn.Width;
+                    subjectColumn.Width = Math.Max(
+                        subjectColumn.MinimumWidth,
+                        Math.Min(ScaleLogical(720), maximumSubjectWidth));
+                }
+
+                var fixedWidth = rankColumn.Width +
+                                 subjectColumn.Width +
+                                 senderColumn.Width +
+                                 receivedColumn.Width;
+                var overflow = fixedWidth - maximumFixedWidth;
+                if (overflow > 0 && preferredColumn != null)
+                {
+                    overflow -= ReduceColumnWidth(preferredColumn, overflow);
+                }
+                if (overflow > 0)
+                {
+                    overflow -= ReduceColumnWidth(subjectColumn, overflow);
+                }
+                if (overflow > 0)
+                {
+                    overflow -= ReduceColumnWidth(senderColumn, overflow);
+                }
+                if (overflow > 0)
+                {
+                    ReduceColumnWidth(receivedColumn, overflow);
+                }
+            }
+            finally
+            {
+                adjustingColumnWidths = false;
+            }
+        }
+
+        private static int ReduceColumnWidth(DataGridViewColumn column, int amount)
+        {
+            if (column == null || amount <= 0 || column.AutoSizeMode == DataGridViewAutoSizeColumnMode.Fill)
+            {
+                return 0;
+            }
+
+            var reducible = Math.Max(0, column.Width - column.MinimumWidth);
+            var reduction = Math.Min(amount, reducible);
+            if (reduction > 0)
+            {
+                column.Width -= reduction;
+            }
+            return reduction;
+        }
+
+        private int ScaleLogical(int value)
+        {
+            var dpi = DeviceDpi <= 0 ? 96 : DeviceDpi;
+            return Math.Max(1, (int)Math.Round(value * dpi / 96F));
+        }
+
+        private void ResultsGridOnCellPainting(
+            object sender,
+            DataGridViewCellPaintingEventArgs eventArgs)
+        {
+            if (eventArgs.RowIndex < 0 ||
+                eventArgs.ColumnIndex != resultsGrid.Columns["SubjectAndSnippet"].Index)
+            {
+                return;
+            }
+
+            var result = resultsGrid.Rows[eventArgs.RowIndex].Tag as SearchResultDto;
+            if (result == null)
+            {
+                return;
+            }
+
+            eventArgs.Paint(
+                eventArgs.ClipBounds,
+                DataGridViewPaintParts.Background |
+                DataGridViewPaintParts.SelectionBackground |
+                DataGridViewPaintParts.Border |
+                DataGridViewPaintParts.Focus);
+
+            var selected = resultsGrid.Rows[eventArgs.RowIndex].Selected;
+            var textColor = selected ? palette.SelectionText : palette.Text;
+            var mutedColor = selected ? palette.SelectionMutedText : palette.MutedText;
+            var bounds = Rectangle.Inflate(eventArgs.CellBounds, -ScaleLogical(7), 0);
+            var subject = CleanInline(result.subject);
+            var snippet = BuildVisibleSnippet(result);
+            if (subject.Length == 0)
+            {
+                subject = "(без темы)";
+            }
+
+            const TextFormatFlags flags = TextFormatFlags.EndEllipsis |
+                                          TextFormatFlags.NoPadding |
+                                          TextFormatFlags.NoPrefix |
+                                          TextFormatFlags.SingleLine |
+                                          TextFormatFlags.VerticalCenter;
+            var measuredSubject = TextRenderer.MeasureText(
+                eventArgs.Graphics,
+                subject,
+                subjectFont,
+                new Size(int.MaxValue, bounds.Height),
+                flags).Width;
+            var subjectWidth = snippet.Length == 0
+                ? bounds.Width
+                : Math.Min(measuredSubject, Math.Max(1, bounds.Width / 2));
+            var subjectBounds = new Rectangle(
+                bounds.Left,
+                bounds.Top,
+                Math.Max(1, subjectWidth),
+                bounds.Height);
+            TextRenderer.DrawText(
+                eventArgs.Graphics,
+                subject,
+                subjectFont,
+                subjectBounds,
+                textColor,
+                flags);
+
+            if (snippet.Length > 0 && subjectBounds.Right < bounds.Right)
+            {
+                var snippetText = "  —  " + snippet;
+                var snippetBounds = new Rectangle(
+                    subjectBounds.Right,
+                    bounds.Top,
+                    bounds.Right - subjectBounds.Right,
+                    bounds.Height);
+                TextRenderer.DrawText(
+                    eventArgs.Graphics,
+                    snippetText,
+                    resultsGrid.DefaultCellStyle.Font,
+                    snippetBounds,
+                    mutedColor,
+                    flags);
+            }
+
+            eventArgs.Handled = true;
+        }
+
+        private void ResultsGridOnPaint(object sender, PaintEventArgs eventArgs)
+        {
+            if (resultsGrid.Rows.Count != 0 || string.IsNullOrWhiteSpace(emptyStateText))
+            {
+                return;
+            }
+
+            var bounds = new Rectangle(
+                ScaleLogical(12),
+                resultsGrid.ColumnHeadersHeight + ScaleLogical(8),
+                Math.Max(1, resultsGrid.ClientSize.Width - ScaleLogical(24)),
+                Math.Max(
+                    ScaleLogical(24),
+                    resultsGrid.ClientSize.Height -
+                    resultsGrid.ColumnHeadersHeight -
+                    ScaleLogical(16)));
+            TextRenderer.DrawText(
+                eventArgs.Graphics,
+                emptyStateText,
+                Font,
+                bounds,
+                palette.MutedText,
+                TextFormatFlags.HorizontalCenter |
+                TextFormatFlags.VerticalCenter |
+                TextFormatFlags.EndEllipsis |
+                TextFormatFlags.NoPrefix);
         }
 
         private async void SearchButtonOnClick(object sender, EventArgs eventArgs)
@@ -170,11 +764,17 @@ namespace RAGSearch
             {
                 return;
             }
+            if (nativeImportRunner.IsRunning)
+            {
+                statusLabel.Text = "Дождитесь завершения индексации или остановите её через ⚙.";
+                return;
+            }
 
             var query = queryBox.Text.Trim();
             if (query.Length == 0)
             {
-                statusLabel.Text = "Введите запрос. Можно описать смысл, точная подстрока не обязательна.";
+                statusLabel.Text = "Введите запрос — можно описать смысл своими словами.";
+                queryBox.Focus();
                 return;
             }
 
@@ -189,32 +789,42 @@ namespace RAGSearch
             queryBox.Enabled = false;
             searchButton.Enabled = false;
             debugOomButton.Enabled = false;
+            resultsGrid.Cursor = Cursors.WaitCursor;
             UpdateResetIndexButtonEnabled();
-            statusLabel.Text = "Векторный + полнотекстовый поиск...";
+            emptyStateText = "Ищу письма...";
+            resultsGrid.Invalidate();
+            statusLabel.Text = "Проверяю локальный сервис...";
             try
             {
-                var scope = getNativeSearchScope();
+                await nativeImportRunner.EnsureServiceReadyAsync(currentCancellation.Token);
+                currentCancellation.Token.ThrowIfCancellationRequested();
+                statusLabel.Text = "Ищу по смыслу и точным совпадениям...";
                 var response = await serviceClient.SearchAsync(
                     query,
-                    12,
+                    SearchLimit,
                     currentCancellation.Token);
                 currentCancellation.Token.ThrowIfCancellationRequested();
                 if (probeRunning || currentGeneration != searchGeneration)
                 {
                     throw new OperationCanceledException(currentCancellation.Token);
                 }
+
                 var results = response == null || response.results == null
                     ? new List<SearchResultDto>()
                     : response.results;
-
-                var summary = showNativeResults(scope, results);
-                statusLabel.Text = FormatNativeFilterStatus(summary, response);
+                PopulateResults(results);
+                statusLabel.Text = FormatSearchStatus(response, results.Count);
             }
             catch (OperationCanceledException)
             {
                 if (!probeRunning && currentGeneration == searchGeneration)
                 {
-                    statusLabel.Text = "Поиск отменён";
+                    statusLabel.Text = "Поиск отменён.";
+                    if (resultsGrid.Rows.Count == 0)
+                    {
+                        emptyStateText = "Поиск отменён.";
+                        resultsGrid.Invalidate();
+                    }
                 }
             }
             catch (Exception ex)
@@ -222,6 +832,11 @@ namespace RAGSearch
                 if (!probeRunning && currentGeneration == searchGeneration)
                 {
                     statusLabel.Text = "Поиск не выполнен: " + ex.Message;
+                    if (resultsGrid.Rows.Count == 0)
+                    {
+                        emptyStateText = "Не удалось выполнить поиск.";
+                        resultsGrid.Invalidate();
+                    }
                 }
             }
             finally
@@ -232,9 +847,11 @@ namespace RAGSearch
                     RunOnUi(() =>
                     {
                         queryBox.Enabled = !probeRunning && !resetRunning;
-                        searchButton.Enabled = !probeRunning;
+                        searchButton.Enabled = !probeRunning && !resetRunning;
                         debugOomButton.Enabled = !probeRunning &&
+                                                       !resetRunning &&
                                                        !nativeImportRunner.IsRunning;
+                        resultsGrid.Cursor = Cursors.Default;
                         UpdateResetIndexButtonEnabled();
                     });
                 }
@@ -242,106 +859,269 @@ namespace RAGSearch
             }
         }
 
-        private static string FormatNativeFilterStatus(
-            NativeFilterSummary summary,
-            SearchResponse response)
+        private void PopulateResults(IList<SearchResultDto> results)
         {
-            if (summary == null)
+            resultsGrid.SuspendLayout();
+            try
             {
-                return "Поиск Outlook All Mailboxes запущен.";
+                resultsGrid.Rows.Clear();
+                for (var index = 0; index < results.Count; index++)
+                {
+                    var result = results[index];
+                    if (result == null)
+                    {
+                        continue;
+                    }
+
+                    var rank = result.rank > 0 ? result.rank : index + 1;
+                    var rowIndex = resultsGrid.Rows.Add(
+                        rank,
+                        BuildSubjectAndSnippet(result),
+                        BuildSender(result),
+                        result.ReceivedDisplay,
+                        BuildFolder(result));
+                    var row = resultsGrid.Rows[rowIndex];
+                    row.Tag = result;
+                    row.Cells[1].ToolTipText = BuildResultToolTip(result);
+                }
+
+                if (resultsGrid.Rows.Count > 0)
+                {
+                    resultsGrid.ClearSelection();
+                    resultsGrid.Rows[0].Selected = true;
+                    emptyStateText = string.Empty;
+                }
+                else
+                {
+                    emptyStateText = "Релевантных писем не найдено.";
+                }
+                resultsGrid.Invalidate();
+            }
+            finally
+            {
+                resultsGrid.ResumeLayout();
+            }
+        }
+
+        private static string BuildSubjectAndSnippet(SearchResultDto result)
+        {
+            var subject = CleanInline(result.subject);
+            var snippet = BuildVisibleSnippet(result);
+            if (subject.Length == 0)
+            {
+                subject = "(без темы)";
+            }
+            return snippet.Length == 0 ? subject : subject + " — " + snippet;
+        }
+
+        private static string BuildSender(SearchResultDto result)
+        {
+            var sender = CleanInline(result.sender_name);
+            return sender.Length == 0 ? CleanInline(result.sender_email) : sender;
+        }
+
+        private static string BuildVisibleSnippet(SearchResultDto result)
+        {
+            var snippet = CleanInline(result.snippet);
+            if (snippet.Length == 0 || result.matched_sources == null)
+            {
+                return snippet;
             }
 
-            var hasRankingDetails = response != null &&
-                                    string.Equals(
-                                        response.ranking,
-                                        "lexical_gate_then_vector_distance_asc",
-                                        StringComparison.Ordinal);
-            var rankingText = string.Empty;
-            if (hasRankingDetails && response.lexical_gate)
+            // A subject/sender/folder hit is represented by the service's metadata
+            // chunk. Showing that raw chunk leaks implementation labels such as
+            // "Conversation" into the result row and merely repeats the subject.
+            if (result.matched_sources.Contains("message_metadata") &&
+                snippet.StartsWith("Subject:", StringComparison.OrdinalIgnoreCase))
             {
-                rankingText = string.Format(
-                    "Literal-совпадений: {0}; сервис вернул: {1}; top-N: {2}. ",
-                    response.lexical_match_count,
-                    response.total,
-                    response.max_results);
-            }
-            else if (hasRankingDetails &&
-                     string.Equals(
-                         response.mode,
-                         "single-token-no-literal",
-                         StringComparison.Ordinal))
-            {
-                rankingText =
-                    "Literal-совпадений нет; для чисто семантического поиска введите фразу из двух или более слов. ";
-            }
-            else if (hasRankingDetails)
-            {
-                rankingText = string.Format(
-                    "Кандидатов: {0}; cutoff d≤{1}; прошло: {2}; literal: {3}; top-N: {4}. ",
-                    response.candidate_count,
-                    response.cutoff_distance.ToString("0.000"),
-                    response.eligible_count,
-                    response.lexical_match_count,
-                    response.max_results);
-            }
-            if (summary.ResultCount == 0)
-            {
-                return rankingText +
-                    "Релевантных совпадений нет; агрегированный список All Mailboxes оставлен пустым до сброса.";
+                return "совпадение в теме или реквизитах письма";
             }
 
-            if (summary.AppliedClauseCount == 0)
+            return snippet;
+        }
+
+        private static string BuildFolder(SearchResultDto result)
+        {
+            var store = CleanInline(result.store_name);
+            var folder = CleanInline(result.folder_path);
+            if (store.Length == 0)
             {
-                return string.Format(
-                    "{0}Сервис вернул {1}, но ни один результат нельзя представить через Outlook Instant Search; список оставлен пустым.",
-                    rankingText,
-                    summary.ResultCount);
+                return folder;
+            }
+            if (folder.Length == 0)
+            {
+                return store;
+            }
+            return store + " · " + folder.TrimStart('\\', '/');
+        }
+
+        private static string BuildResultToolTip(SearchResultDto result)
+        {
+            return string.Format(
+                "{0}\r\n{1}\r\n{2}\r\nДвойной щелчок открывает исходное письмо Outlook.",
+                CleanInline(result.subject),
+                BuildVisibleSnippet(result),
+                BuildFolder(result));
+        }
+
+        private static string CleanInline(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return string.Empty;
             }
 
-            var text = string.Format(
-                "{0}Сервис вернул {1}; в All Mailboxes передано условий: {2}. Поиск охватывает выбранные в Outlook почтовые хранилища и архивы.",
-                rankingText,
-                summary.ResultCount,
-                summary.AppliedClauseCount);
-            if (hasRankingDetails)
+            return value
+                .Replace('\r', ' ')
+                .Replace('\n', ' ')
+                .Replace('\t', ' ')
+                .Trim();
+        }
+
+        private Font OwnFont(Font font)
+        {
+            ownedFonts.Add(font);
+            return font;
+        }
+
+        private static string FormatSearchStatus(SearchResponse response, int resultCount)
+        {
+            if (resultCount == 0)
             {
-                text += response.lexical_gate
-                    ? " Сервис отдаёт literal-совпадения первыми; native-список сохраняет порядок Outlook."
-                    : " Векторная часть сервиса ранжирована по distance (d↑); native-список сохраняет порядок Outlook.";
+                if (response != null &&
+                    string.Equals(response.mode, "single-token-no-literal", StringComparison.Ordinal))
+                {
+                    return "Точных совпадений нет. Для поиска только по смыслу введите фразу из двух или более слов.";
+                }
+                return "Релевантных писем не найдено. Outlook остался в текущей папке.";
             }
-            if (summary.ApproximateClauseCount > 0)
+
+            return string.Format(
+                "Найдено писем: {0}. Порядок — релевантность RAG Search; двойной щелчок открывает исходное письмо Outlook.",
+                resultCount);
+        }
+
+        private void ResultsGridOnCellDoubleClick(
+            object sender,
+            DataGridViewCellEventArgs eventArgs)
+        {
+            if (eventArgs.RowIndex < 0)
             {
-                text += " Проекция приблизительная: Outlook AQS ищет кавыченные фразы из тем результатов (в том числе в теле письма), а не EntryID.";
+                return;
             }
-            if (summary.SkippedCount > 0)
+            OpenResult(resultsGrid.Rows[eventArgs.RowIndex]);
+        }
+
+        private void ResultsGridOnKeyDown(object sender, KeyEventArgs eventArgs)
+        {
+            if (eventArgs.KeyCode != Keys.Enter || resultsGrid.CurrentRow == null)
             {
-                text += string.Format(
-                    " Не удалось представить в view: {0}.",
-                    summary.SkippedCount);
+                return;
             }
-            if (summary.ProjectionWasTruncated)
+
+            eventArgs.Handled = true;
+            eventArgs.SuppressKeyPress = true;
+            OpenResult(resultsGrid.CurrentRow);
+        }
+
+        private void OpenResult(DataGridViewRow row)
+        {
+            var result = row == null ? null : row.Tag as SearchResultDto;
+            if (result == null)
             {
-                text += " Технический запрос укорочен до безопасного лимита Outlook.";
+                return;
             }
-            return text;
+
+            try
+            {
+                openSearchResult(result);
+                statusLabel.Text = "Письмо открыто в отдельном окне Outlook.";
+            }
+            catch (Exception ex)
+            {
+                statusLabel.Text =
+                    "Не удалось открыть письмо: " + ex.Message +
+                    " Если его переместили или удалили, обновите индекс.";
+            }
         }
 
         private void ClearButtonOnClick(object sender, EventArgs eventArgs)
         {
+            searchGeneration++;
+            if (searchCancellation != null)
+            {
+                searchCancellation.Cancel();
+            }
+            resultsGrid.Rows.Clear();
+            emptyStateText = "Введите запрос, чтобы найти письма по смыслу.";
+            resultsGrid.Invalidate();
+            queryBox.Clear();
+            queryBox.Focus();
+            statusLabel.Text = "Результаты очищены. Текущий вид Outlook не изменён.";
+        }
+
+        private void CollapseButtonOnClick(object sender, EventArgs eventArgs)
+        {
+            if (paneFloating)
+            {
+                statusLabel.Text = "Сначала прикрепите панель снизу, затем её можно свернуть.";
+                return;
+            }
+            var previousCollapsed = paneCollapsed;
             try
             {
-                searchGeneration++;
-                if (searchCancellation != null)
-                {
-                    searchCancellation.Cancel();
-                }
-                clearNativeSearch();
-                statusLabel.Text = "Поиск Outlook All Mailboxes сброшен.";
+                var nextCollapsed = !previousCollapsed;
+                setPaneCollapsed(nextCollapsed);
+                ApplyCollapsedState(nextCollapsed);
             }
             catch (Exception ex)
             {
-                statusLabel.Text = "Не удалось сбросить фильтр Outlook: " + ex.Message;
+                ApplyCollapsedState(previousCollapsed);
+                statusLabel.Text = "Не удалось изменить размер панели: " + ex.Message;
             }
+        }
+
+        private void ApplyCollapsedState(bool collapsed)
+        {
+            paneCollapsed = collapsed;
+            resultsGrid.Visible = !collapsed;
+            statusLabel.Visible = !collapsed;
+            rootLayout.RowStyles[2].Height = collapsed ? 0 : ScaleLogical(24);
+            collapsePaneMenuButton.Text = collapsed
+                ? "Развернуть панель"
+                : "Свернуть панель";
+            commandBar.PerformLayout();
+        }
+
+        private void DetachButtonOnClick(object sender, EventArgs eventArgs)
+        {
+            var previousCollapsed = paneCollapsed;
+            var previousFloating = paneFloating;
+            try
+            {
+                if (paneCollapsed)
+                {
+                    setPaneCollapsed(false);
+                    ApplyCollapsedState(false);
+                }
+                var floating = togglePaneFloating();
+                SetPaneFloating(floating);
+            }
+            catch (Exception ex)
+            {
+                ApplyCollapsedState(previousCollapsed);
+                SetPaneFloating(previousFloating);
+                statusLabel.Text = "Не удалось изменить положение панели: " + ex.Message;
+            }
+        }
+
+        private void SettingsButtonOnClick(object sender, EventArgs eventArgs)
+        {
+            settingsMenu.Show(
+                settingsButton,
+                new Point(
+                    settingsButton.Width - settingsMenu.PreferredSize.Width,
+                    settingsButton.Height));
         }
 
         private async void IndexButtonOnClick(object sender, EventArgs eventArgs)
@@ -354,6 +1134,11 @@ namespace RAGSearch
             if (nativeImportRunner.IsRunning)
             {
                 statusLabel.Text = "Индексация уже выполняется.";
+                return;
+            }
+            if (searchCancellation != null)
+            {
+                statusLabel.Text = "Дождитесь завершения поиска или очистите запрос.";
                 return;
             }
 
@@ -393,7 +1178,6 @@ namespace RAGSearch
             {
                 nativeImportRunner.RequestStop();
                 stopButton.Enabled = false;
-                return;
             }
         }
 
@@ -411,7 +1195,7 @@ namespace RAGSearch
             }
             if (searchCancellation != null)
             {
-                statusLabel.Text = "Дождитесь завершения семантического поиска перед Debug OOM.";
+                statusLabel.Text = "Дождитесь завершения поиска перед диагностикой Outlook Guard.";
                 return;
             }
 
@@ -425,9 +1209,8 @@ namespace RAGSearch
             stopButton.Enabled = false;
             try
             {
-                // Keep this synchronous on the Outlook UI thread.  The probe
-                // locates one MailItem and immediately calls one documented
-                // protected getter; it does not depend on the service or Timer.
+                // Keep this synchronous on the Outlook UI thread. The probe
+                // deliberately reads one protected property for diagnostics.
                 var result = oomGuardProbe.Run(message =>
                 {
                     statusLabel.Text = message;
@@ -437,7 +1220,9 @@ namespace RAGSearch
             }
             catch (Exception ex)
             {
-                statusLabel.Text = "Debug OOM завершился внутренней ошибкой: " + ex.GetType().Name;
+                statusLabel.Text =
+                    "Диагностика Outlook Guard завершилась внутренней ошибкой: " +
+                    ex.GetType().Name;
             }
             finally
             {
@@ -465,12 +1250,12 @@ namespace RAGSearch
             }
             if (searchCancellation != null)
             {
-                statusLabel.Text = "Дождитесь завершения семантического поиска.";
+                statusLabel.Text = "Дождитесь завершения поиска.";
                 return;
             }
             if (probeRunning)
             {
-                statusLabel.Text = "Дождитесь завершения Debug OOM.";
+                statusLabel.Text = "Дождитесь завершения диагностики Outlook Guard.";
                 return;
             }
 
@@ -523,6 +1308,9 @@ namespace RAGSearch
                         response.deleted_messages,
                         response.deleted_attachments,
                         response.deleted_chunks);
+                resultsGrid.Rows.Clear();
+                emptyStateText = "Индекс очищен. Выполните индексацию через ⚙.";
+                resultsGrid.Invalidate();
             }
             catch (OperationCanceledException)
             {
@@ -559,17 +1347,22 @@ namespace RAGSearch
 
         private void QueryBoxOnKeyDown(object sender, KeyEventArgs eventArgs)
         {
+            if (eventArgs.KeyCode == Keys.Escape)
+            {
+                eventArgs.SuppressKeyPress = true;
+                ClearButtonOnClick(sender, EventArgs.Empty);
+                return;
+            }
             if (eventArgs.KeyCode != Keys.Enter)
             {
                 return;
             }
 
             eventArgs.SuppressKeyPress = true;
-            if (!searchButton.Enabled)
+            if (searchButton.Enabled)
             {
-                return;
+                SearchButtonOnClick(sender, EventArgs.Empty);
             }
-            SearchButtonOnClick(sender, EventArgs.Empty);
         }
 
         private void NativeImportRunnerOnProgressChanged(object sender, NativeImportProgress progress)
@@ -598,13 +1391,15 @@ namespace RAGSearch
             try
             {
                 var health = await serviceClient.GetHealthAsync(CancellationToken.None);
-                statusLabel.Text = string.Format(
-                    "Локальный сервис готов. Embeddings: {0}",
-                    health == null ? "unknown" : health.embedding_backend ?? health.status ?? "unknown");
+                statusLabel.Text = health != null &&
+                                   string.Equals(health.status, "ok", StringComparison.OrdinalIgnoreCase)
+                    ? "Локальный сервис готов."
+                    : "Локальный сервис ответил, но сообщил об ошибке.";
             }
             catch (Exception)
             {
-                statusLabel.Text = "Python-сервис не запущен. Запустите python service\\run.py.";
+                statusLabel.Text =
+                    "Локальный сервис сейчас не запущен; он запустится автоматически при первом поиске.";
             }
         }
 
@@ -631,6 +1426,157 @@ namespace RAGSearch
             action();
         }
 
+        private sealed class PanePalette
+        {
+            private PanePalette(bool dark)
+            {
+                IsDark = dark;
+                if (dark)
+                {
+                    Background = Color.FromArgb(31, 31, 31);
+                    AlternateBackground = Color.FromArgb(35, 35, 35);
+                    Surface = Color.FromArgb(38, 38, 38);
+                    HeaderBackground = Color.FromArgb(43, 43, 43);
+                    InputBackground = Color.FromArgb(48, 48, 48);
+                    ButtonBackground = Color.FromArgb(45, 45, 45);
+                    ButtonHover = Color.FromArgb(58, 58, 58);
+                    ButtonPressed = Color.FromArgb(68, 68, 68);
+                    Text = Color.FromArgb(243, 243, 243);
+                    MutedText = Color.FromArgb(174, 174, 174);
+                    Border = Color.FromArgb(73, 73, 73);
+                    Selection = Color.FromArgb(14, 72, 112);
+                    SelectionText = Color.White;
+                    SelectionMutedText = Color.FromArgb(220, 235, 247);
+                    ChipBackground = Color.FromArgb(24, 62, 88);
+                    ChipText = Color.FromArgb(143, 211, 255);
+                }
+                else
+                {
+                    Background = Color.White;
+                    AlternateBackground = Color.FromArgb(250, 250, 250);
+                    Surface = Color.FromArgb(250, 250, 250);
+                    HeaderBackground = Color.FromArgb(246, 246, 246);
+                    InputBackground = Color.White;
+                    ButtonBackground = Color.FromArgb(250, 250, 250);
+                    ButtonHover = Color.FromArgb(235, 235, 235);
+                    ButtonPressed = Color.FromArgb(220, 220, 220);
+                    Text = Color.FromArgb(32, 32, 32);
+                    MutedText = Color.FromArgb(96, 96, 96);
+                    Border = Color.FromArgb(210, 210, 210);
+                    Selection = Color.FromArgb(204, 228, 247);
+                    SelectionText = Color.FromArgb(24, 24, 24);
+                    SelectionMutedText = Color.FromArgb(72, 72, 72);
+                    ChipBackground = Color.FromArgb(222, 238, 252);
+                    ChipText = Color.FromArgb(0, 90, 158);
+                }
+
+                Accent = Color.FromArgb(15, 108, 189);
+                AccentBorder = Color.FromArgb(0, 90, 158);
+                AccentHover = Color.FromArgb(17, 119, 208);
+                AccentPressed = Color.FromArgb(0, 90, 158);
+            }
+
+            public bool IsDark { get; private set; }
+            public Color Background { get; private set; }
+            public Color AlternateBackground { get; private set; }
+            public Color Surface { get; private set; }
+            public Color HeaderBackground { get; private set; }
+            public Color InputBackground { get; private set; }
+            public Color ButtonBackground { get; private set; }
+            public Color ButtonHover { get; private set; }
+            public Color ButtonPressed { get; private set; }
+            public Color Text { get; private set; }
+            public Color MutedText { get; private set; }
+            public Color Border { get; private set; }
+            public Color Selection { get; private set; }
+            public Color SelectionText { get; private set; }
+            public Color SelectionMutedText { get; private set; }
+            public Color ChipBackground { get; private set; }
+            public Color ChipText { get; private set; }
+            public Color Accent { get; private set; }
+            public Color AccentBorder { get; private set; }
+            public Color AccentHover { get; private set; }
+            public Color AccentPressed { get; private set; }
+
+            public static PanePalette Create()
+            {
+                return new PanePalette(IsWindowsDarkMode());
+            }
+
+            private static bool IsWindowsDarkMode()
+            {
+                try
+                {
+                    using (var key = Registry.CurrentUser.OpenSubKey(
+                        @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                    {
+                        var value = key == null ? null : key.GetValue("AppsUseLightTheme");
+                        return value is int && (int)value == 0;
+                    }
+                }
+                catch (Exception)
+                {
+                    return false;
+                }
+            }
+        }
+
+        private sealed class DarkMenuColorTable : ProfessionalColorTable
+        {
+            private readonly PanePalette palette;
+
+            public DarkMenuColorTable(PanePalette palette)
+            {
+                this.palette = palette;
+                UseSystemColors = false;
+            }
+
+            public override Color ToolStripDropDownBackground
+            {
+                get { return palette.Surface; }
+            }
+
+            public override Color MenuBorder
+            {
+                get { return palette.Border; }
+            }
+
+            public override Color MenuItemBorder
+            {
+                get { return palette.Border; }
+            }
+
+            public override Color MenuItemSelected
+            {
+                get { return palette.ButtonHover; }
+            }
+
+            public override Color ImageMarginGradientBegin
+            {
+                get { return palette.Surface; }
+            }
+
+            public override Color ImageMarginGradientMiddle
+            {
+                get { return palette.Surface; }
+            }
+
+            public override Color ImageMarginGradientEnd
+            {
+                get { return palette.Surface; }
+            }
+
+            public override Color SeparatorDark
+            {
+                get { return palette.Border; }
+            }
+
+            public override Color SeparatorLight
+            {
+                get { return palette.Border; }
+            }
+        }
+
         protected override void Dispose(bool disposing)
         {
             if (disposing)
@@ -652,6 +1598,12 @@ namespace RAGSearch
                     resetCancellation = null;
                     cancellation.Cancel();
                 }
+                settingsMenu.Dispose();
+                foreach (var font in ownedFonts)
+                {
+                    font.Dispose();
+                }
+                ownedFonts.Clear();
             }
 
             base.Dispose(disposing);

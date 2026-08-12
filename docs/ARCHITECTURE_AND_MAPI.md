@@ -20,7 +20,7 @@ Extended MAPI worker на C++ нужен как Outlook-specific connector. Ег
 
 ```mermaid
 flowchart LR
-    UI["VSTO-панель в Outlook (C#)"] --> R["NativeImportRunner"]
+    UI["Нижняя VSTO WinForms-панель"] --> R["NativeImportRunner"]
     R --> A["Python-адаптер import_native_mapi.py"]
     A --> N["NativeMapiProbe.exe (C++)"]
     N --> M["Extended MAPI / профиль classic Outlook"]
@@ -28,15 +28,15 @@ flowchart LR
     A -- "POST /v1/messages" --> S["Python search service"]
     S --> DB["SQLite + FTS5 + embeddings"]
     UI -- "POST /v1/search" --> S
-    S -- "результаты" --> UI
-    UI --> V["Explorer.Search / список Outlook"]
+    S -- "до 25 строк в порядке backend" --> UI
+    UI -- "двойной щелчок: StoreID + EntryID" --> O["Исходное письмо Outlook"]
 ```
 
 1. Кнопка **«Индексировать»** вызывает не старый Outlook-индексатор, а
-   [`NativeImportRunner.RunAsync()`](../RAGSearch/SearchPaneControl.cs#L353).
+   [`NativeImportRunner.RunAsync()`](../RAGSearch/NativeImportRunner.cs#L54).
 
 2. Runner проверяет Python-сервис и затем запускает
-   [`service/import_native_mapi.py`](../RAGSearch/NativeImportRunner.cs#L225).
+   [`service/import_native_mapi.py`](../RAGSearch/NativeImportRunner.cs#L682).
 
 3. Python-адаптер запускает
    [`NativeMapiProbe.exe --jsonl`](../service/import_native_mapi.py#L791). Сам
@@ -58,9 +58,18 @@ flowchart LR
    на чанки, считает embeddings и записывает данные в SQLite:
    [`SearchService._ingest_one`](../service/ragsearch_service/app.py#L168).
 
-7. При поиске VSTO отправляет запрос в `/v1/search`. Получив результаты, C#-слой
-   проецирует их в штатный список Outlook через `Explorer.Search`. Это
-   UI-specific интеграция и она закономерно остаётся Outlook-зависимой.
+7. При поиске VSTO отправляет запрос в `/v1/search` с пустыми filters и лимитом
+   25: [`SearchPaneControl.SearchAsync`](../RAGSearch/SearchPaneControl.cs#L632).
+   Результаты последовательно добавляются в собственный нижний WinForms
+   `DataGridView`, без повторной сортировки, поэтому сохраняют порядок backend:
+   [`PopulateResults`](../RAGSearch/SearchPaneControl.cs#L733). Штатные Search bar,
+   текущая папка и список Outlook не изменяются.
+
+8. Двойной щелчок по строке (или `Enter`) передаёт точные `entry_id` и `store_id`
+   из результата в `NameSpace.GetItemFromID`, после чего исходный `MailItem`
+   открывается отдельным окном Outlook:
+   [`OpenSearchResult`](../RAGSearch/ThisAddIn.cs#L115). Этот небольшой UI/navigation
+   слой закономерно остаётся Outlook-зависимым.
 
 ## Что такое MAPI
 
@@ -249,7 +258,7 @@ infrastructure/
   attachment_store.py
 
 hosts/
-  outlook_vsto/        # Outlook UI и projection результатов
+  outlook_vsto/        # собственный Outlook UI и открытие оригиналов по locator
 
 diagnostics/
   outlook_oom_guard/   # OomGuardProbe и guard scripts
