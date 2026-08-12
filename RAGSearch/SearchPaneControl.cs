@@ -30,7 +30,7 @@ namespace RAGSearch
         private readonly Button collapseButton;
         private readonly Button detachButton;
         private readonly Button settingsButton;
-        private readonly DataGridView resultsGrid;
+        private readonly OutlookSafeDataGridView resultsGrid;
         private readonly Label statusLabel;
         private readonly ContextMenuStrip settingsMenu;
         private readonly ToolStripMenuItem collapsePaneMenuButton;
@@ -166,6 +166,7 @@ namespace RAGSearch
             resultsGrid.Paint += ResultsGridOnPaint;
             resultsGrid.ClientSizeChanged += ResultsGridOnClientSizeChanged;
             resultsGrid.ColumnWidthChanged += ResultsGridOnColumnWidthChanged;
+            resultsGrid.ScrollRowsRequested += ResultsGridOnScrollRowsRequested;
 
             statusLabel = new Label
             {
@@ -323,9 +324,9 @@ namespace RAGSearch
             return button;
         }
 
-        private DataGridView CreateResultsGrid()
+        private OutlookSafeDataGridView CreateResultsGrid()
         {
-            var grid = new DataGridView
+            var grid = new OutlookSafeDataGridView
             {
                 AllowUserToAddRows = false,
                 AllowUserToDeleteRows = false,
@@ -352,7 +353,14 @@ namespace RAGSearch
                 SelectionMode = DataGridViewSelectionMode.FullRowSelect,
                 ShowCellErrors = false,
                 ShowCellToolTips = true,
-                ShowEditingIcon = false
+                ShowEditingIcon = false,
+                // The stock DataGridView wheel path updates its child Win32
+                // scrollbar with SetScrollInfo.  Inside an Outlook custom task
+                // pane that synchronous call can deadlock Outlook's UI thread.
+                // Keep the native scrollbar disabled; OutlookSafeDataGridView
+                // consumes WM_MOUSEWHEEL and scrolls rows without forwarding the
+                // message into that path.
+                ScrollBars = ScrollBars.None
             };
             grid.ColumnHeadersDefaultCellStyle.BackColor = palette.HeaderBackground;
             grid.ColumnHeadersDefaultCellStyle.ForeColor = palette.Text;
@@ -536,6 +544,54 @@ namespace RAGSearch
         private void ResultsGridOnClientSizeChanged(object sender, EventArgs eventArgs)
         {
             FitColumnsToViewport(null);
+        }
+
+        private void ResultsGridOnScrollRowsRequested(
+            object sender,
+            ScrollRowsRequestedEventArgs eventArgs)
+        {
+            if (eventArgs == null ||
+                eventArgs.WheelDetents == 0 ||
+                resultsGrid.IsDisposed ||
+                resultsGrid.ClientSize.Height <= resultsGrid.ColumnHeadersHeight ||
+                resultsGrid.Rows.Count == 0)
+            {
+                return;
+            }
+
+            var dataHeight = Math.Max(
+                1,
+                resultsGrid.ClientSize.Height - resultsGrid.ColumnHeadersHeight);
+            var rowHeight = Math.Max(1, resultsGrid.Rows[0].Height);
+            var visibleRowCount = Math.Max(1, dataHeight / rowHeight);
+            var maximumFirstRow = Math.Max(
+                0,
+                resultsGrid.Rows.Count - visibleRowCount);
+            var currentFirstRow = resultsGrid.FirstDisplayedScrollingRowIndex;
+            if (currentFirstRow < 0)
+            {
+                currentFirstRow = 0;
+            }
+
+            var configuredLines = SystemInformation.MouseWheelScrollLines;
+            if (configuredLines == 0)
+            {
+                return;
+            }
+            var rowsPerDetent = configuredLines < 0
+                ? visibleRowCount
+                : configuredLines;
+            var requestedFirstRow = (long)currentFirstRow -
+                                    ((long)eventArgs.WheelDetents * rowsPerDetent);
+            var targetFirstRow = (int)Math.Max(
+                0L,
+                Math.Min((long)maximumFirstRow, requestedFirstRow));
+            if (targetFirstRow == currentFirstRow)
+            {
+                return;
+            }
+
+            resultsGrid.FirstDisplayedScrollingRowIndex = targetFirstRow;
         }
 
         private void ResultsGridOnColumnWidthChanged(
@@ -1424,6 +1480,77 @@ namespace RAGSearch
             }
 
             action();
+        }
+
+        private sealed class ScrollRowsRequestedEventArgs : EventArgs
+        {
+            public ScrollRowsRequestedEventArgs(int wheelDetents)
+            {
+                WheelDetents = wheelDetents;
+            }
+
+            public int WheelDetents { get; private set; }
+        }
+
+        private sealed class OutlookSafeDataGridView : DataGridView
+        {
+            private const int WmMouseWheel = 0x020A;
+            private const int WmMouseHorizontalWheel = 0x020E;
+            private const int WheelDelta = 120;
+
+            private int wheelDeltaRemainder;
+
+            public event EventHandler<ScrollRowsRequestedEventArgs> ScrollRowsRequested;
+
+            protected override void OnMouseDown(MouseEventArgs eventArgs)
+            {
+                if (CanFocus && !Focused)
+                {
+                    Focus();
+                }
+                base.OnMouseDown(eventArgs);
+            }
+
+            protected override void WndProc(ref Message message)
+            {
+                if (message.Msg == WmMouseWheel)
+                {
+                    var delta = unchecked((short)(
+                        (message.WParam.ToInt64() >> 16) & 0xffff));
+                    if (delta != 0)
+                    {
+                        if (wheelDeltaRemainder != 0 &&
+                            Math.Sign(wheelDeltaRemainder) != Math.Sign(delta))
+                        {
+                            wheelDeltaRemainder = 0;
+                        }
+                        wheelDeltaRemainder += delta;
+                        var detents = wheelDeltaRemainder / WheelDelta;
+                        wheelDeltaRemainder -= detents * WheelDelta;
+                        if (detents != 0)
+                        {
+                            var handler = ScrollRowsRequested;
+                            if (handler != null)
+                            {
+                                handler(this, new ScrollRowsRequestedEventArgs(detents));
+                            }
+                        }
+                    }
+
+                    // Never call DataGridView.OnMouseWheel here. Its native
+                    // scrollbar update is the call that blocks Outlook's STA.
+                    return;
+                }
+
+                if (message.Msg == WmMouseHorizontalWheel)
+                {
+                    // Columns are fitted to the pane, so horizontal wheel input
+                    // has no useful target. Consume it inside the task pane too.
+                    return;
+                }
+
+                base.WndProc(ref message);
+            }
         }
 
         private sealed class PanePalette
