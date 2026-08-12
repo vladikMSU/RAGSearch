@@ -99,8 +99,8 @@ Inbox, Sent и PST `Archives`, но не удовлетворяет требов
 
 ## Ranking до UI
 
-Сервис агрегирует лучший chunk на уровне сообщения до top-K. Для фразы он
-объединяет literal FTS hits с semantic candidates, сортирует vector-часть по
+Сервис агрегирует лучшие chunks на уровне нейтрального документа до top-K. Для
+фразы он объединяет literal FTS hits с semantic candidates, сортирует vector-часть по
 `vector_distance = 1 - cosine_similarity`, применяет model-specific floor и
 adaptive window. UI не пересчитывает ranking и не переставляет результаты.
 
@@ -114,9 +114,10 @@ embedding model:
 - если literal hit отсутствует, single-token semantic guess не показывается.
 
 Поэтому `киберспорт`, `кибер` и `спорт` находят индексированное `киберспорт`, даже
-если dense model ставит короткое нерелевантное слово выше. Service требует
-нейтральную document schema v4; более старую Outlook-shaped локальную БД нужно
-удалить и заново построить из PST/OST.
+если dense model ставит короткое нерелевантное слово выше. HTTP-клиент и service
+должны использовать protocol `4`, а текущая локальная SQLite schema имеет version
+`4`. Более старую Outlook-shaped локальную БД нужно удалить и заново построить из
+PST/OST; version field в самом document payload отсутствует.
 
 ## Документация Microsoft для отвергнутого пути
 

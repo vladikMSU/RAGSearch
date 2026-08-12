@@ -1,7 +1,7 @@
 # Microsoft MAPIStubLibrary headers
 
 This directory vendors the Extended MAPI headers required to compile
-`connectors/outlook_mapi/native/OutlookMapiReader` from a clean checkout.
+`connectors/outlook_mapi/native/OutlookMapiReader.vcxproj` from a clean checkout.
 
 - Upstream: <https://github.com/microsoft/MAPIStubLibrary>
 - Commit: `a9505d73351554078431fc950a0bc34ada6fe39b`

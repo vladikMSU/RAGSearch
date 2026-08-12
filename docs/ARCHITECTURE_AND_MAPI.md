@@ -132,7 +132,7 @@ JSONL. Reader не выбирает общий application directory и не п�
 ## Жизненный цикл вложения без общего spool
 
 1. VSTO создаёт приватный каталог конкретного запуска в своём локальном runtime
-   каталоге `%LOCALAPPDATA%\\RAGSearch\\reader-runs`.
+   каталоге `%LOCALAPPDATA%\RAGSearch\reader-runs`.
 2. VSTO передаёт его reader-у через `--attachment-dir`.
 3. Reader сохраняет только bounded `ATTACH_BY_VALUE` streams и пишет путь в свой
    JSONL. Embedded/OLE/by-reference attachments остаются metadata-only.

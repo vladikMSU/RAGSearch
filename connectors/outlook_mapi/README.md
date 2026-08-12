@@ -43,13 +43,19 @@ provider установленного classic Outlook.
 ## Сборка
 
 Native project включён в корневой `RAGSearch.sln` и использует MSVC v143/C++17.
-Из корня репозитория:
+Полная сборка из корня репозитория собирает и reader, и VSTO host:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
 ```
 
-Или только reader:
+Для этой команды нужны оба Visual Studio workloads: **Desktop development with
+C++** и **Office/SharePoint development**, а также **.NET Framework 4.8 Targeting
+Pack**. Скрипт по умолчанию делает Debug x64 build и создаёт/переиспользует
+локальный development certificate для VSTO manifest.
+
+Только reader можно собрать из **Developer PowerShell for VS 2022**; тогда
+Office/VSTO workload и signing certificate не нужны:
 
 ```powershell
 msbuild .\connectors\outlook_mapi\native\OutlookMapiReader.vcxproj `
@@ -64,8 +70,9 @@ connectors\outlook_mapi\native\bin\x64\Release\OutlookMapiReader.exe
 ```
 
 Extended MAPI headers закреплены в `third_party/MAPIStubLibrary`; готовый EXE в
-Git не хранится. Для clean clone нужен Visual Studio workload **Desktop development
-with C++**. Битность reader должна совпадать с Outlook; проект намеренно только x64.
+Git не хранится. Для native-only clean clone нужен Visual Studio workload
+**Desktop development with C++**. Битность reader должна совпадать с Outlook;
+проект намеренно только x64.
 
 ## CLI
 
@@ -99,6 +106,21 @@ JSONL без извлечения файлов:
 `0` означает unlimited для stores/folders/messages. Для
 `--body-preview-chars` значение `0` отключает body. Диагностика и summary всегда
 идут в `stderr`; при `--jsonl` в `stdout` находятся только JSON records.
+
+Числовой CLI-контракт:
+
+| Параметр | Default | Допустимый диапазон | Значение `0` |
+|---|---:|---:|---|
+| `--max-stores` | `0` | 0…1,000,000 | unlimited |
+| `--max-folders` | `100` | 0…1,000,000 | unlimited |
+| `--max-messages` | `20` | 0…1,000,000 | unlimited |
+| `--body-preview-chars` | `240` | 0…4,000,000 | не читать body |
+| `--max-attachment-bytes` | 64 MiB | 0…1 TiB | не извлекать content |
+| `--max-message-attachment-bytes` | 64 MiB | 0…1 TiB | не извлекать content |
+| `--max-total-attachment-bytes` | `0` | 0…1 TiB | unlimited process total |
+
+Отсутствующий `--attachment-dir` также переводит вложения в metadata-only режим
+независимо от byte caps.
 
 ## JSONL contract
 
@@ -140,8 +162,9 @@ Reader сохраняет Outlook-specific поля внутри connector bound
 Остальные текстовые поля всегда strings. `temp_path` пуст для metadata-only,
 unsupported attachment methods и файлов, не прошедших byte caps.
 
-`body_truncated=true` означает, что `body` достиг переданного
-`--body-preview-chars`; consumer обязан сохранить этот признак вместе с part.
+`body_truncated=true` означает, что исходный body был длиннее переданного
+`--body-preview-chars` и поле `body` было обрезано; consumer обязан сохранить этот
+признак вместе с part. Body длиной ровно в cap не считается обрезанным.
 `attachments_truncated=true` означает, что attachment table содержала больше
 `4095` строк: reader не открывал, не сохранял и не включал в JSONL оставшиеся
 вложения. Поле всегда присутствует и обычно равно `false`.
@@ -195,7 +218,7 @@ finally {
   письма, сбрасываемый перед следующим письмом; default `67108864`, а `0` отключает
   extraction;
 - `--max-total-attachment-bytes` — cap одного процесса; `0` означает unlimited,
-  но per-attachment cap продолжает действовать;
+  но per-attachment и per-message caps продолжают действовать;
 - частично записанный или превысивший cap файл удаляется; если удалить его не
   удалось, reader немедленно завершает run с fatal exit code `4`, чтобы не
   продолжать запись поверх уже нарушенного disk budget.
@@ -213,8 +236,8 @@ powershell.exe -NoProfile -File `
   .\connectors\outlook_mapi\tests\test_reader_smoke.ps1 -OfflineOnly
 ```
 
-Она проверяет help contract нового per-message cap и exit code `64` для значения
-выше hard ceiling, не выполняя MAPI logon.
+Она проверяет help contract per-message cap и exit code `64` для byte limit выше
+hard ceiling 1 TiB, не выполняя MAPI logon.
 
 Live smoke читает default Outlook profile напрямую, валидирует JSONL и containment
 вложений; Python/service ему не нужны:
@@ -239,8 +262,9 @@ Smoke требует настроенный default profile и хотя бы о�
 
 ## Exit codes
 
-- `0` — проход завершён без recoverable errors;
-- `1` — records выданы, но были recoverable ошибки отдельных folders/messages;
+- `0` — `--help` либо scan, завершённый без recoverable errors;
+- `1` — scan завершён с одной или несколькими recoverable ошибками store, folder,
+  message или attachment; JSON records при этом могли отсутствовать;
 - `3` — `MAPILogonEx` не смог открыть default profile;
 - `4` — fatal runtime failure;
 - `64` — неверные CLI arguments.

@@ -7,7 +7,7 @@ scoped commercial-compatibility audit at `docs/LICENSE_COMPATIBILITY.md`.
 ## Microsoft MAPIStubLibrary
 
 RAGSearch vendors the minimal header subset required by
-`connectors/outlook_mapi/native/OutlookMapiReader` from:
+`connectors/outlook_mapi/native/OutlookMapiReader.vcxproj` from:
 
 - project: <https://github.com/microsoft/MAPIStubLibrary>
 - commit: `a9505d73351554078431fc950a0bc34ada6fe39b`

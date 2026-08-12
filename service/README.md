@@ -27,19 +27,25 @@ The server binds only to `127.0.0.1:8765`. On first start it creates:
 There is no service spool. Binary part content crosses the API inline as base64; no
 producer filesystem path is accepted by the service.
 
-The token is generated atomically. On Windows the service removes inherited ACEs
-from its data root and grants full control only to the current user, SYSTEM and
-Administrators; on POSIX it applies user-only modes. Startup fails if the data path
-cannot be hardened. Clients send the token in `X-RAGSearch-Token`; it is never
-accepted in a URL.
+The token is generated atomically. On a newly created Windows data root, the
+service disables inherited ACEs and grants full control to the current user, SYSTEM
+and Administrators; on POSIX it applies user-only modes. The current Windows
+hardening step does not remove explicit ACEs already present on a reused/custom
+data directory, so verify such a directory is private before using it. Startup
+fails if the ACL command itself fails. Clients send the token in
+`X-RAGSearch-Token`; it is never accepted in a URL.
 
 For an isolated development instance:
 
 ```powershell
 Push-Location .\service
-.\.venv\Scripts\python.exe -m ragsearch_service --data-dir .\dev-data --port 8766
+$devData = Join-Path $env:LOCALAPPDATA 'RAGSearch-dev'
+.\.venv\Scripts\python.exe -m ragsearch_service --data-dir $devData --port 8766
 Pop-Location
 ```
+
+Keep custom data directories outside the checkout: every data root contains a
+bearer token as well as the disposable index database.
 
 ## API
 
@@ -105,10 +111,12 @@ The JSON body is one document directly, not a batch wrapper:
 ```
 
 Required document fields are `source_key`, `kind`, `title`, `metadata`, `locator`
-and `parts`. `metadata` and `locator` must be JSON objects. They are serialized
-canonically for storage, but their JSON value is otherwise opaque to the core.
-`title` is limited to 65,536 characters so even a full 25-result response remains
-within the host's bounded response envelope.
+and `parts`; unknown fields are rejected. `source_key` is limited to 65,536
+characters and is whitespace-significant (the service does not trim producer
+identity), `kind` is limited to 256, `title` to 65,536, and `parts` to 4,096 items.
+`metadata` and `locator` must be JSON objects. They are serialized canonically for
+storage, but their JSON value is otherwise opaque to the core. The title limit also
+keeps a full 25-result response within the host's bounded response envelope.
 All request strings and JSON object keys must contain Unicode scalar values;
 unpaired UTF-16 surrogate code points are rejected with HTTP 400. Valid astral
 characters, including emoji and JSON surrogate-pair escapes, are accepted.
@@ -120,10 +128,16 @@ measured as UTF-8 JSON. Each object is also limited to depth 16 and 10,000 JSON
 nodes. The reserved key `__type` is rejected because the .NET Framework wire
 serializer interprets it as runtime type metadata; all other keys remain opaque.
 
-Each part requires a non-empty `key` and `kind`. Optional fields are `name`,
-`media_type`, `size`, `truncated`, `text` and `content_base64`. `text` and
-`content_base64` are mutually exclusive. When base64 is provided, its decoded byte
-length must equal `size`. Omitting both stores part metadata without extracted text.
+Each part rejects unknown fields and requires a non-empty `key` (at most 32,768
+characters) and `kind` (at most 256); part keys must be unique within one document.
+Optional fields are `name`
+(32,768), `media_type` (4,096), `size`,
+`truncated`, `text` and `content_base64`. `size` must be an integer from zero through
+2^63-1; it may be omitted for metadata-only or producer-text parts, but is
+effectively required with non-empty `content_base64` because it must equal the
+decoded byte length. `truncated`, when present, must be boolean. `text` and
+`content_base64` are mutually exclusive. Omitting both stores part metadata without
+extracted text.
 
 The default decoded binary limit is 8 MiB per part. The HTTP request limit is
 48 MiB measured over the fully serialized UTF-8 body; the VSTO host applies the
@@ -134,9 +148,11 @@ extracted with the standard library. Unsupported formats are recorded as
 extracted from one binary part is capped at 8 MiB characters, and all
 binary-derived text in one document shares the same 8 MiB aggregate budget. The
 synthesized metadata search projection is capped at 4 MiB characters without
-changing stored metadata or part rows. Producer-supplied `text` is preserved
-exactly. It is indexed first and returns HTTP 400 if it alone exceeds a hard
-per-document limit; derived metadata and binary projections are then
+changing stored metadata or part rows. Producer-supplied `text` is not cropped, but
+it is deterministically normalized for chunk indexing (line endings, NULs and
+horizontal whitespace); the original text itself is not stored, only its hash and
+normalized chunks. Producer text is indexed first and returns HTTP 400 if it alone
+exceeds a hard per-document limit; derived metadata and binary projections are then
 deterministically cropped to the remaining capacity instead of rejecting the
 document. The hard limits are 16 Mi characters and 16,384 chunks. Search queries
 are limited to 8,192 characters. Together these bounds prevent a valid request
@@ -151,19 +167,22 @@ Response:
 
 `source_key` is the sole public identity. Retrying it updates the document and
 replaces only that document's parts and chunks, so removed parts do not remain in
-the index. Invalid requests return HTTP 400. The removed `/v1/messages` endpoint
-has no compatibility alias and returns HTTP 404.
+the index. Schema/validation errors return HTTP 400; an HTTP body above 48 MiB
+returns HTTP 413 `request_too_large`. The removed `/v1/messages` endpoint has no
+compatibility alias and returns HTTP 404.
 
 ### Search
 
 `POST /v1/search`
 
 ```json
-{"query":"when was the product launch moved","limit":20}
+{"query":"when was the product launch moved","limit":25}
 ```
 
-Only `query` and `limit` are accepted. Source-specific filters are deliberately not
-part of the neutral core contract.
+Only `query` and `limit` are accepted. `query` must be non-empty and no longer than
+8,192 characters; `limit` must be an integer from 1 through 100. The service still
+returns at most its configured hard cap of 25 results. Source-specific filters are
+deliberately not part of the neutral core contract.
 
 The response contains generic document fields and the opaque producer data:
 
@@ -177,13 +196,30 @@ this response as strict UTF-8 through a 128 MiB streaming/parser cap.
       "source_key": "outlook_mapi:<64-hex-sha256>",
       "kind": "email",
       "title": "Quarterly launch plan",
-      "metadata": {"sender_name":"Alex","received_at":"2026-08-11T09:01:00Z"},
-      "locator": {"connector":"outlook_mapi","store_id":"...","entry_id":"..."},
+      "metadata": {
+        "sender_name": "Alex",
+        "sender_email": "alex@example.test",
+        "to": "user@example.test",
+        "cc": "",
+        "sent_at": "2026-08-11T09:00:00Z",
+        "received_at": "2026-08-11T09:01:00Z",
+        "modified_at": "2026-08-11T09:02:00Z",
+        "folder_path": "Mailbox - User/Inbox",
+        "store_name": "Mailbox - User",
+        "internet_message_id": "<example@example.test>",
+        "conversation_id": "conversation-id"
+      },
+      "locator": {
+        "connector": "outlook_mapi",
+        "store_id": "outlook-store-id",
+        "entry_id": "outlook-entry-id",
+        "folder_entry_id": "outlook-folder-id"
+      },
       "rank": 1,
       "snippet": "The launch was moved to October.",
       "snippet_part": "body",
       "matched_parts": ["body", "attachment:notes.txt"],
-      "hybrid_score": 0.91,
+      "hybrid_score": 0.7586,
       "lexical_score": 0.74,
       "lexical_match_kind": "token",
       "vector_similarity": 0.77,
@@ -191,11 +227,14 @@ this response as strict UTF-8 through a 128 MiB streaming/parser cap.
       "ranking_basis": "lexical_token"
     }
   ],
+  "total": 1,
   "mode": "hybrid-semantic",
-  "candidate_count": 42,
-  "eligible_count": 7,
+  "candidate_count": 1,
+  "eligible_count": 1,
   "lexical_match_count": 1,
   "lexical_gate": false,
+  "best_vector_similarity": 0.77,
+  "best_vector_distance": 0.23,
   "cutoff_similarity": 0.67,
   "cutoff_distance": 0.33,
   "max_results": 25,
@@ -204,12 +243,13 @@ this response as strict UTF-8 through a 128 MiB streaming/parser cap.
 ```
 
 Results are aggregated per document. Literal retrieval uses both the FTS5
-`unicode61` token index and a trigram index. The vector and lexical ranking behavior
-is unchanged from the message index: prefix/substring evidence enables the lexical
-gate, single-token queries require literal evidence, and multi-token semantic
-results use an adaptive model-specific cosine cutoff. `snippet_part` identifies the
-exact chunk label used to produce `snippet`; `matched_parts` remains the aggregate
-of matched labels for the document. The service returns at most 25 documents.
+`unicode61` token index and a trigram index. The ranking policy uses
+prefix/substring evidence to enable the lexical gate, requires literal evidence for
+single-token queries, and applies an adaptive model-specific cosine cutoff to
+multi-token semantic results. `snippet_part` identifies the
+exact chunk label used to produce `snippet`; `matched_parts` contains up to eight
+distinct matched labels for the document and is therefore a bounded summary, not
+an exhaustive list. The service returns at most 25 documents.
 
 ### Stats and reset
 
