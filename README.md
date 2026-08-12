@@ -3,7 +3,7 @@
 Экспериментальный локальный поиск по почте, совместимый с classic Microsoft Outlook
 для Windows x64.
 VSTO-надстройка показывает собственную нижнюю WinForms-панель поиска и результатов,
-отдельный C++ worker читает настроенный Outlook profile через read-only Extended
+отдельный C++ reader читает настроенный Outlook profile через read-only Extended
 MAPI, а Python-сервис индексирует письма и вложения в SQLite/FTS5. Штатные строка
 поиска и список писем Outlook при этом не изменяются.
 
@@ -22,13 +22,18 @@ Extended MAPI здесь не является скачанным Python-пак�
 
 ## Что уже находится в репозитории
 
-- исходники VSTO-надстройки, native x64 worker и Python-сервиса;
+- исходники VSTO-надстройки, native x64 reader и Python-сервиса;
 - шесть необходимых headers Microsoft MAPIStubLibrary, их MIT-лицензия и точный
   upstream commit в [third_party/MAPIStubLibrary](third_party/MAPIStubLibrary);
 - dependency-free Python provider и тесты — для базового режима сторонние
   Python-пакеты и скачивание модели не нужны;
-- конфигурации MSBuild и CMake; native EXE собирается в
-  `native-mapi-probe\build-direct\NativeMapiProbe.exe`.
+- единая MSBuild solution; native EXE собирается в
+  `connectors\outlook_mapi\native\bin\x64\<Configuration>\OutlookMapiReader.exe`.
+
+Source-specific Outlook ingestion собран в `connectors/outlook_mapi`, а
+`service/ragsearch_service` содержит только локальный search service. VSTO host
+находится в `hosts/outlook_vsto`; экспериментальная Outlook Object Model
+диагностика из production tree удалена.
 
 В Git намеренно не хранятся `.venv`, build artifacts, база, письма, вложения,
 токены, private signing keys и необязательная neural model.
@@ -43,9 +48,8 @@ Extended MAPI здесь не является скачанным Python-пак�
 - workload `Desktop development with C++`, MSVC v143 x64/x86 и Windows 10/11 SDK.
 
 Для запуска дополнительно нужны Python 3.11+, VSTO Runtime, classic Outlook x64 и
-настроенный default Outlook profile. Разрядность native worker и Outlook обязана
-совпадать; текущая конфигурация проекта — только x64. CMake 3.20+ необязателен и
-нужен лишь при сборке native worker через CMake вместо MSBuild.
+настроенный default Outlook profile. Разрядность native reader и Outlook обязана
+совпадать; solution предоставляет только платформу x64.
 
 ## Сборка из чистого clone
 
@@ -59,7 +63,7 @@ py -3 -m venv .\service\.venv
 ```
 
 Соберите оба проекта одной командой. Скрипт находит Visual Studio через `vswhere`,
-собирает native worker и создаёт либо повторно использует локальный non-exportable
+собирает native reader и создаёт либо повторно использует локальный non-exportable
 development certificate в `Cert:\CurrentUser\My`, потому что полный VSTO `Build`
 технически требует подписанный manifest:
 
@@ -68,8 +72,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
 ```
 
 Дополнительные MAPI-файлы скачивать или указывать через include path не нужно.
-`RAGSearch.sln` пока содержит только VSTO-проект, поэтому native worker собирается
-отдельной первой командой.
+`RAGSearch.sln` содержит VSTO host и `OutlookMapiReader`; одна конфигурация
+`Debug|x64` или `Release|x64` собирает оба компонента.
 
 Сертификат автора и private key в Git не входят. Для повторной сборки можно оставить
 созданный скриптом локальный dev certificate. Чтобы использовать свой уже
@@ -77,33 +81,37 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 `
+  -Configuration Release `
   -CertificateThumbprint YOUR_CERTIFICATE_THUMBPRINT
 ```
 
 Автоматический self-signed certificate разрешён скриптом только для `Debug`.
-`-VstoConfiguration Release` требует явно переданный production certificate.
+`-Configuration Release` требует явно переданный production certificate.
 
 Скрипт решает воспроизводимость development-сборки, но не доверие к издателю.
 Не коммитьте `.pfx`, private key или локальный thumbprint. Для распространения нужен
 нормальный installer и сертификат, которому доверяет целевая организация;
 репозиторий их не содержит. Автоматически созданный сертификат также может
 потребовать явного доверия в соответствии с локальной ClickOnce/Office policy.
-Ручные MSBuild/CMake команды и overrides описаны в
-[native-mapi-probe/README.md](native-mapi-probe/README.md).
+Прямой запуск reader и connector tests описаны в
+[connectors/outlook_mapi/README.md](connectors/outlook_mapi/README.md).
 
 ## Запуск
 
 Python-сервис можно запустить вручную:
 
 ```powershell
-.\service\.venv\Scripts\python.exe .\service\run.py `
-  --delete-spool-after-ingest
+Push-Location .\service
+.\.venv\Scripts\python.exe -m ragsearch_service --delete-spool-after-ingest
+Pop-Location
 ```
 
 После сборки и регистрации надстройки перезапустите classic Outlook. Если сервис
 не запущен, панель сама использует точный workspace-путь
 `service\.venv\Scripts\python.exe`; при отсутствии локальной neural model включается
 воспроизводимый hashing provider без дополнительных зависимостей.
+Непустой индекс привязан к одной embedding-модели и размерности: при смене
+конфигурации сервис требует явной очистки индекса и полной переиндексации.
 
 Результаты появляются в закреплённой снизу таблице RAG Search в том же порядке,
 в котором их вернул backend; максимум — 25 писем. Двойной щелчок по строке открывает
@@ -115,8 +123,8 @@ Python-сервис можно запустить вручную:
 Ручной потоковый импорт:
 
 ```powershell
-.\service\.venv\Scripts\python.exe .\service\import_native_mapi.py `
-  --executable .\native-mapi-probe\build-direct\NativeMapiProbe.exe `
+.\service\.venv\Scripts\python.exe .\connectors\outlook_mapi\adapter.py `
+  --executable .\connectors\outlook_mapi\native\bin\x64\Debug\OutlookMapiReader.exe `
   --full-scan
 ```
 
@@ -130,7 +138,10 @@ Python-сервис можно запустить вручную:
 .\service\.venv\Scripts\python.exe -B -m unittest `
   discover -s service\tests -t service -v
 
-.\native-mapi-probe\build-direct\NativeMapiProbe.exe --help
+.\service\.venv\Scripts\python.exe -B -m unittest `
+  discover -s connectors\outlook_mapi\tests -t . -v
+
+.\connectors\outlook_mapi\native\bin\x64\Debug\OutlookMapiReader.exe --help
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 `
   -Target Rebuild
@@ -140,17 +151,20 @@ Live E2E требует реального Outlook profile и подготовл
 не является универсальным тестом чистого clone:
 
 ```powershell
-powershell.exe -NoProfile -File .\scripts\test_native_mapi_adapter_e2e.ps1
+powershell.exe -NoProfile -File `
+  .\connectors\outlook_mapi\tests\test_adapter_e2e.ps1
 ```
 
-Последняя локальная проверка: 33/33 Python tests, подписанный VSTO Rebuild, direct
-native x64 compile и native-to-service E2E — PASS.
+Текущая структурная проверка: 27/27 service tests, 14/14 connector tests,
+канонический полный `Debug|x64` Rebuild и штатный v143 `Release|x64` Rebuild
+`OutlookMapiReader` — PASS.
+Live E2E с реальным Outlook profile и временной schema v3 БД — PASS.
 
 ## Честные ограничения
 
 - Это workspace-прототип, а не готовый installer или portable package.
 - VSTO работает только в classic Outlook; новый Outlook не поддерживается.
-- Worker читает stores через Outlook MAPI providers, а не парсит PST/OST как файлы.
+- Reader читает stores через Outlook MAPI providers, а не парсит PST/OST как файлы.
 - Индексация пока выполняет полный scan; checkpoints, notifications и tombstones не
   реализованы.
 - Если письмо после индексации перемещено или удалено, сохранённая пара
@@ -160,9 +174,7 @@ native x64 compile и native-to-service E2E — PASS.
 - Локальная neural-конфигурация необязательна и не воспроизводится без отдельно
   выбранных package/model artifacts.
 
-Подробности эксперимента и Outlook Guard:
-[docs/PROTOTYPE_NOTES.md](docs/PROTOTYPE_NOTES.md). Выбор способа показа результатов
-и отвергнутый эксперимент с `Explorer.Search`:
+Граница отображения результатов и причины не использовать `Explorer.Search`:
 [docs/OUTLOOK_SEARCH_PROJECTION.md](docs/OUTLOOK_SEARCH_PROJECTION.md).
 
 ## Лицензии и внешние компоненты
@@ -181,9 +193,9 @@ native x64 compile и native-to-service E2E — PASS.
   изменений на условиях применимой лицензии Visual Studio;
 - Windows, .NET Framework, VSTO Runtime и classic Outlook — внешние лицензируемые
   prerequisites, а не часть лицензии RAGSearch;
-- optional `sentence-transformers`/model напрямую permissive, но их версии и
-  транзитивный набор не закреплены, поэтому neural-поставка пока не прошла полный
-  лицензионный аудит.
+- optional `sentence-transformers==5.7.0`/model напрямую permissive, но
+  транзитивные artifacts, hashes и revision модели не закреплены, поэтому
+  neural-поставка пока не прошла полный лицензионный аудит.
 
 Для собственного кода корневой `LICENSE` пока не выбран. Полная матрица, границы
 проверки и действия перед коммерческой поставкой:

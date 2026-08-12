@@ -14,8 +14,7 @@ namespace RAGSearch
         private const int DefaultFloatingPaneHeight = 240;
 
         private LocalServiceClient serviceClient;
-        private OomGuardProbe oomGuardProbe;
-        private NativeImportRunner nativeImportRunner;
+        private OutlookMapiImportRunner outlookMapiImportRunner;
         private SearchPaneControl searchPaneControl;
         private Microsoft.Office.Tools.CustomTaskPane searchTaskPane;
         private Outlook.Explorer taskPaneExplorer;
@@ -23,33 +22,21 @@ namespace RAGSearch
 
         private void ThisAddIn_Startup(object sender, EventArgs e)
         {
-            StartupTrace.Step("BEGIN ThisAddIn_Startup");
             try
             {
-                StartupTrace.Step("BEGIN LocalServiceClient constructor (loopback HTTP only)");
                 serviceClient = new LocalServiceClient();
-                StartupTrace.Step("END LocalServiceClient constructor");
+                outlookMapiImportRunner = new OutlookMapiImportRunner(serviceClient);
 
-                oomGuardProbe = new OomGuardProbe(Application);
-                nativeImportRunner = new NativeImportRunner(serviceClient);
-                StartupTrace.Step("constructed native runner and explicit OOM diagnostic");
-
-                StartupTrace.Step("BEGIN Application.ActiveExplorer (window lookup; no mail/address getters)");
                 taskPaneExplorer = Application.ActiveExplorer();
-                StartupTrace.Step("END Application.ActiveExplorer; found=" + (taskPaneExplorer != null));
                 if (taskPaneExplorer != null)
                 {
-                    StartupTrace.Step("BEGIN SearchPaneControl constructor (WinForms only)");
                     searchPaneControl = new SearchPaneControl(
                         serviceClient,
-                        oomGuardProbe,
-                        nativeImportRunner,
+                        outlookMapiImportRunner,
                         OpenSearchResult,
                         SetSearchPaneCollapsed,
                         ToggleSearchPaneFloating);
-                    StartupTrace.Step("END SearchPaneControl constructor");
 
-                    StartupTrace.Step("BEGIN CustomTaskPanes.Add/show");
                     searchTaskPane = CustomTaskPanes.Add(
                         searchPaneControl,
                         "            RAG Search",
@@ -59,14 +46,10 @@ namespace RAGSearch
                     searchTaskPane.Height = DefaultExpandedPaneHeight;
                     searchTaskPane.Visible = true;
                     searchPaneControl.SetPaneFloating(false);
-                    StartupTrace.Step("END CustomTaskPanes.Add/show bottom result pane");
                 }
-
-                StartupTrace.Step("END ThisAddIn_Startup; production startup performed no mail/address OOM reads");
             }
-            catch (Exception ex)
+            catch
             {
-                StartupTrace.Failure("ThisAddIn_Startup", ex);
                 try
                 {
                     if (searchTaskPane != null)
@@ -75,11 +58,9 @@ namespace RAGSearch
                         CustomTaskPanes.Remove(searchTaskPane);
                     }
                 }
-                catch (Exception cleanupException)
+                catch
                 {
-                    StartupTrace.Failure(
-                        "ThisAddIn_Startup CustomTaskPane cleanup",
-                        cleanupException);
+                    // Preserve the original startup exception if task-pane cleanup fails.
                 }
                 finally
                 {
@@ -92,11 +73,9 @@ namespace RAGSearch
                         searchPaneControl.Dispose();
                     }
                 }
-                catch (Exception cleanupException)
+                catch
                 {
-                    StartupTrace.Failure(
-                        "ThisAddIn_Startup SearchPaneControl cleanup",
-                        cleanupException);
+                    // Preserve the original startup exception if control cleanup fails.
                 }
                 finally
                 {
@@ -107,9 +86,8 @@ namespace RAGSearch
                 throw;
             }
 
-            // Production ingestion is the explicit Extended MAPI child process.
-            // The labelled diagnostic button performs one deliberate protected OOM
-            // getter; there is no Outlook Object Model indexing path in the add-in.
+            // Production ingestion is the explicit Extended MAPI child process;
+            // there is no Outlook Object Model indexing path in the add-in.
         }
 
         private void OpenSearchResult(SearchResultDto result)
@@ -118,8 +96,8 @@ namespace RAGSearch
             {
                 throw new ArgumentNullException("result");
             }
-            if (string.IsNullOrWhiteSpace(result.entry_id) ||
-                string.IsNullOrWhiteSpace(result.store_id))
+            if (string.IsNullOrWhiteSpace(result.EntryId) ||
+                string.IsNullOrWhiteSpace(result.StoreId))
             {
                 throw new InvalidOperationException(
                     "В локальном индексе нет EntryID или StoreID этого письма.");
@@ -132,7 +110,7 @@ namespace RAGSearch
                 // This callback runs directly from the WinForms double-click on
                 // Outlook's UI/STA thread. Do not move this COM work to Task.Run.
                 session = Application.Session;
-                outlookItem = session.GetItemFromID(result.entry_id, result.store_id);
+                outlookItem = session.GetItemFromID(result.EntryId, result.StoreId);
                 var mailItem = outlookItem as Outlook.MailItem;
                 if (mailItem == null)
                 {
@@ -292,9 +270,9 @@ namespace RAGSearch
                     searchTaskPane.Height = height;
                 }
             }
-            catch (Exception rollbackException)
+            catch
             {
-                StartupTrace.Failure("RestorePanePosition", rollbackException);
+                // Best-effort rollback must not mask the original docking failure.
             }
         }
 
@@ -326,12 +304,10 @@ namespace RAGSearch
                 searchPaneControl = null;
             }
 
-            oomGuardProbe = null;
-
-            if (nativeImportRunner != null)
+            if (outlookMapiImportRunner != null)
             {
-                nativeImportRunner.Dispose();
-                nativeImportRunner = null;
+                outlookMapiImportRunner.Dispose();
+                outlookMapiImportRunner = null;
             }
 
             if (serviceClient != null)
@@ -351,11 +327,8 @@ namespace RAGSearch
 
         private void InternalStartup()
         {
-            StartupTrace.BeginSession();
-            StartupTrace.Step("BEGIN InternalStartup event registration");
             Startup += new EventHandler(ThisAddIn_Startup);
             Shutdown += new EventHandler(ThisAddIn_Shutdown);
-            StartupTrace.Step("END InternalStartup event registration");
         }
 
         #endregion

@@ -28,14 +28,13 @@
     <AssemblyName>RAGSearch</AssemblyName>
     <LoadBehavior>3</LoadBehavior>
     <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
-    <DefineConstants>VSTO40;UseOfficeInterop</DefineConstants>
+    <DefineConstants>VSTO40</DefineConstants>
     <!-- Do not pin a machine-specific developer thumbprint in source control.
          The full VSTO Build target requires SignManifests=true plus a locally owned
          certificate; scripts\build.ps1 supplies both explicitly. -->
     <SignManifests Condition="'$(SignManifests)' == ''">false</SignManifests>
     <BootstrapperEnabled>true</BootstrapperEnabled>
     <BootstrapperComponentsLocation>HomeSite</BootstrapperComponentsLocation>
-    <ResolveComReferenceSilent>true</ResolveComReferenceSilent>
   </PropertyGroup>
   <ItemGroup>
     <BootstrapperPackage Include="Microsoft.VSTORuntime.4.0">
@@ -100,6 +99,15 @@
     <DefineConstants>$(DefineConstants);TRACE</DefineConstants>
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
+  <PropertyGroup>
+    <SignManifests>true</SignManifests>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ManifestKeyFile>RAGSearch_TemporaryKey.pfx</ManifestKeyFile>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ManifestCertificateThumbprint>AE22FDAAFD8C0F0EE16AAEB40A4A83E8D9097D78</ManifestCertificateThumbprint>
+  </PropertyGroup>
   <!--
     This section specifies references for the project.
   -->
@@ -142,42 +150,16 @@
       <Private>True</Private>
     </Reference>
   </ItemGroup>
-  <Choose>
-    <When Condition="$([System.String]::Copy(&quot;;$(DefineConstants);&quot;).ToLower().Contains(';useofficeinterop;')) or $([System.String]::Copy(&quot;,$(DefineConstants),&quot;).ToLower().Contains(',useofficeinterop,'))">
-      <ItemGroup>
-        <Reference Include="Office, Version=15.0.0.0, Culture=neutral, PublicKeyToken=71e9bce111e9429c">
-          <Private>False</Private>
-          <EmbedInteropTypes>true</EmbedInteropTypes>
-        </Reference>
-        <Reference Include="Microsoft.Office.Interop.Outlook, Version=15.0.0.0, Culture=neutral, PublicKeyToken=71e9bce111e9429c">
-          <Private>False</Private>
-          <EmbedInteropTypes>true</EmbedInteropTypes>
-        </Reference>
-      </ItemGroup>
-    </When>
-    <Otherwise>
-      <ItemGroup>
-        <COMReference Include="Microsoft.Office.Core">
-          <Guid>{2DF8D04C-5BFA-101B-BDE5-00AA0044DE52}</Guid>
-          <VersionMajor>2</VersionMajor>
-          <VersionMinor>7</VersionMinor>
-          <Lcid>0</Lcid>
-          <WrapperTool>tlbimp</WrapperTool>
-          <Isolated>False</Isolated>
-          <EmbedInteropTypes>true</EmbedInteropTypes>
-        </COMReference>
-        <COMReference Include="Microsoft.Office.Interop.Outlook">
-          <Guid>{00062FFF-0000-0000-C000-000000000046}</Guid>
-          <VersionMajor>9</VersionMajor>
-          <VersionMinor>5</VersionMinor>
-          <Lcid>0</Lcid>
-          <WrapperTool>tlbimp</WrapperTool>
-          <Isolated>False</Isolated>
-          <EmbedInteropTypes>true</EmbedInteropTypes>
-        </COMReference>
-      </ItemGroup>
-    </Otherwise>
-  </Choose>
+  <ItemGroup>
+    <Reference Include="Office, Version=15.0.0.0, Culture=neutral, PublicKeyToken=71e9bce111e9429c">
+      <Private>False</Private>
+      <EmbedInteropTypes>true</EmbedInteropTypes>
+    </Reference>
+    <Reference Include="Microsoft.Office.Interop.Outlook, Version=15.0.0.0, Culture=neutral, PublicKeyToken=71e9bce111e9429c">
+      <Private>False</Private>
+      <EmbedInteropTypes>true</EmbedInteropTypes>
+    </Reference>
+  </ItemGroup>
   <ItemGroup>
     <Reference Include="stdole, Version=7.0.3300.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a">
       <Private>False</Private>
@@ -200,65 +182,43 @@
     <Compile Include="ComRelease.cs" />
     <Compile Include="LocalServiceClient.cs" />
     <Compile Include="Models.cs" />
-    <Compile Include="NativeImportRunner.cs" />
-    <Compile Include="OomGuardProbe.cs" />
+    <Compile Include="OutlookMapiImportRunner.cs" />
     <Compile Include="SearchPaneControl.cs">
       <SubType>UserControl</SubType>
-    </Compile>
-    <Compile Include="StartupTrace.cs" />
-    <EmbeddedResource Include="Properties\Resources.resx">
-      <Generator>ResXFileCodeGenerator</Generator>
-      <LastGenOutput>Resources.Designer.cs</LastGenOutput>
-      <SubType>Designer</SubType>
-    </EmbeddedResource>
-    <Compile Include="Properties\Resources.Designer.cs">
-      <AutoGen>True</AutoGen>
-      <DependentUpon>Resources.resx</DependentUpon>
-    </Compile>
-    <None Include="Properties\Settings.settings">
-      <Generator>SettingsSingleFileGenerator</Generator>
-      <LastGenOutput>Settings.Designer.cs</LastGenOutput>
-    </None>
-    <Compile Include="Properties\Settings.Designer.cs">
-      <AutoGen>True</AutoGen>
-      <DependentUpon>Settings.settings</DependentUpon>
     </Compile>
     <Compile Include="ThisAddIn.cs">
       <SubType>Code</SubType>
     </Compile>
+    <None Include="RAGSearch_TemporaryKey.pfx" />
     <None Include="ThisAddIn.Designer.xml">
       <DependentUpon>ThisAddIn.cs</DependentUpon>
     </None>
     <Compile Include="ThisAddIn.Designer.cs">
       <DependentUpon>ThisAddIn.Designer.xml</DependentUpon>
     </Compile>
-    <Content Include="..\THIRD_PARTY_NOTICES.md">
+    <Content Include="..\..\THIRD_PARTY_NOTICES.md">
       <Link>THIRD_PARTY_NOTICES.md</Link>
       <TargetPath>THIRD_PARTY_NOTICES.md</TargetPath>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="..\third_party\MAPIStubLibrary\LICENSE">
+    <Content Include="..\..\third_party\MAPIStubLibrary\LICENSE">
       <Link>MAPIStubLibrary-LICENSE.txt</Link>
       <TargetPath>MAPIStubLibrary-LICENSE.txt</TargetPath>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <AppDesigner Include="Properties\" />
   </ItemGroup>
-  <PropertyGroup>
-    <VisualStudioVersion Condition="'$(VisualStudioVersion)' == ''">10.0</VisualStudioVersion>
-    <VSToolsPath Condition="'$(VSToolsPath)' == ''">$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)</VSToolsPath>
-  </PropertyGroup>
   <!-- Include the build rules for a C# project. -->
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
   <!-- Include additional build rules for an Office application add-in. -->
-  <Import Project="$(VSToolsPath)\OfficeTools\Microsoft.VisualStudio.Tools.Office.targets" Condition="'$(VSToolsPath)' != ''" />
+  <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v17.0\OfficeTools\Microsoft.VisualStudio.Tools.Office.targets" />
   <!-- This section defines VSTO properties that describe the host-changeable project properties. -->
   <ProjectExtensions>
     <VisualStudio>
       <FlavorProperties GUID="{BAA0C2D2-18E2-41B9-852F-F413020CAA33}">
         <ProjectProperties HostName="Outlook" HostPackage="{29A7B9D7-A7F1-4328-8EF0-6B2D1A56B2C1}" OfficeVersion="15.0" VstxVersion="4.0" ApplicationType="Outlook" Language="cs" TemplatesPath="" DebugInfoExeName="#Software\Microsoft\Office\16.0\Outlook\InstallRoot\Path#outlook.exe" AddItemTemplatesGuid="{A58A78EB-1C92-4DDD-80CF-E8BD872ABFC4}" />
         <Host Name="Outlook" GeneratedCodeNamespace="RAGSearch" IconIndex="0">
-          <HostItem Name="ThisAddIn" Code="ThisAddIn.cs" CanonicalName="ThisAddIn" CanActivate="false" IconIndex="1" Blueprint="ThisAddIn.Designer.xml" GeneratedCode="ThisAddIn.Designer.cs" />
+          <HostItem Name="ThisAddIn" Code="ThisAddIn.cs" CanonicalName="AddIn" CanActivate="false" IconIndex="1" Blueprint="ThisAddIn.Designer.xml" GeneratedCode="ThisAddIn.Designer.cs" />
         </Host>
       </FlavorProperties>
     </VisualStudio>

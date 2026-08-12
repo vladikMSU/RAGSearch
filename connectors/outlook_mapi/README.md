@@ -1,21 +1,23 @@
-# Native Extended MAPI probe
+# Outlook MAPI connector
 
-Отдельный x64 console producer для bounded streaming-чтения Outlook stores через
-**Extended MAPI**, без Outlook Object Model и без прямого чтения заблокированного `.ost`.
+Connector объединяет Python-адаптер `adapter.py` и отдельный x64 console reader
+`native/OutlookMapiReader.vcxproj`. Reader потоково читает Outlook stores через
+**Extended MAPI**, без Outlook Object Model и без прямого чтения заблокированного
+`.ost`; adapter валидирует JSONL и передаёт письма локальному search service по HTTP.
 
-Probe:
+Reader:
 
 - вызывает `MAPIInitialize` и `MAPILogonEx` для default Outlook profile;
 - перечисляет message stores и всю IPM-иерархию папок, но emit делает только для
   email-like message classes `IPM.Note` и `IPM.Note.*`;
 - открывает каждое сообщение read-only и отдаёт identity, store/folder context,
   Subject/Body, sender/recipient display metadata, даты, Internet Message ID,
-  conversation/search identity и metadata вложений;
+  conversation identity и metadata вложений;
 - умеет опционально читать `ATTACH_BY_VALUE` в явно переданный bounded spool;
 - не содержит MAPI `SetProps`, `SaveChanges`, `Create*`, `Delete*`,
   `SubmitMessage`, `MAPI_MODIFY` или иных send/write операций. Единственная запись
   на диск — новые уникальные файлы внутри явно переданного `--spool-dir`;
-- использует безопасные конечные лимиты по умолчанию, чтобы первый probe не начал
+- использует безопасные конечные лимиты по умолчанию, чтобы первый scan не начал
   обходить многолетний mailbox целиком.
 
 Это не parser файлов PST/OST. Доступ выполняется через установленный MAPI provider
@@ -32,69 +34,44 @@ Outlook, поэтому Outlook может быть открыт, а блоки�
   10/11 SDK.
 - Минимальный набор Extended MAPI headers из официального Microsoft
   MAPIStubLibrary уже зафиксирован в
-  `..\third_party\MAPIStubLibrary\include`. Точный upstream commit и MIT-лицензия
+  `..\..\third_party\MAPIStubLibrary\include`. Точный upstream commit и MIT-лицензия
   записаны рядом в `README.md` и `LICENSE`.
 
-MSBuild/CMake также копирует `THIRD_PARTY_NOTICES.md` и
+MSBuild также копирует `THIRD_PARTY_NOTICES.md` и
 `MAPIStubLibrary-LICENSE.txt` рядом с EXE. Сохраняйте их в бинарной поставке.
 
 Microsoft отдельно требует совпадения bitness MAPI application и установленного
 Outlook: <https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/building-mapi-applications-on-32-bit-and-64-bit-platforms>.
 
-## Сборка через MSBuild
+Команда сборки выполняется из корня репозитория; команды прямого запуска — из
+`connectors\outlook_mapi`.
 
-Из **x64 Native Tools Command Prompt for VS 2022**:
+## Сборка
+
+Reader и VSTO host входят в одну solution и используют одну конфигурацию:
 
 ```powershell
-msbuild .\NativeMapiProbe.vcxproj /m `
-  /p:Configuration=Release `
-  /p:Platform=x64
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 `
+  -Configuration Debug
 ```
 
-Бинарник:
+Артефакты reader разделены по конфигурациям и не перезаписывают друг друга:
 
 ```text
-build-direct\NativeMapiProbe.exe
+connectors\outlook_mapi\native\bin\x64\Debug\OutlookMapiReader.exe
+connectors\outlook_mapi\native\bin\x64\Release\OutlookMapiReader.exe
 ```
 
-## Сборка через CMake
-
-```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release
-```
-
-Бинарник для Visual Studio generator:
-
-```text
-build-direct\NativeMapiProbe.exe
-```
-
-### Direct build, использованный на этой машине
-
-На машине нет штатного C++ workload, но есть bundled x64 ScopeCppSDK. Проверенный
-эквивалентный Release build выполнен с headers из репозитория:
-
-```powershell
-$scopeSdk = 'C:\Program Files\Microsoft Visual Studio\2022\Community\SDK\ScopeCppSDK\vc15'
-$mapiHeaders = (Resolve-Path '..\third_party\MAPIStubLibrary\include').Path
-$env:INCLUDE = "$mapiHeaders;$scopeSdk\VC\include;$scopeSdk\SDK\include\ucrt;$scopeSdk\SDK\include\um;$scopeSdk\SDK\include\shared"
-$env:LIB = "$scopeSdk\VC\lib;$scopeSdk\SDK\lib"
-$env:PATH = "$scopeSdk\VC\bin;$scopeSdk\SDK\bin;$env:PATH"
-
-& "$scopeSdk\VC\bin\cl.exe" /nologo /std:c++17 /EHsc /W4 `
-  /permissive- /utf-8 /O2 /DNDEBUG /DUNICODE /D_UNICODE `
-  /DWIN32_LEAN_AND_MEAN /DNOMINMAX `
-  /Fo:build-direct\main.obj /Fe:build-direct\NativeMapiProbe.exe `
-  main.cpp /link MAPI32.lib Ole32.lib
-```
+`scripts/build.ps1` требует Visual Studio 2022 с MSBuild, Office development и
+Desktop development with C++. Альтернативных CMake, include override и direct
+compiler путей проект не поддерживает.
 
 ## Запуск
 
 Первый короткий positive-control:
 
 ```powershell
-.\build-direct\NativeMapiProbe.exe `
+.\native\bin\x64\Debug\OutlookMapiReader.exe `
   --max-stores 0 `
   --max-folders 25 `
   --max-messages 5 `
@@ -105,7 +82,7 @@ $env:PATH = "$scopeSdk\VC\bin;$scopeSdk\SDK\bin;$env:PATH"
 дорогой, поэтому его стоит делать только осознанно:
 
 ```powershell
-.\build-direct\NativeMapiProbe.exe `
+.\native\bin\x64\Debug\OutlookMapiReader.exe `
   --max-folders 0 `
   --max-messages 0 `
   --body-preview-chars 500
@@ -115,23 +92,24 @@ $env:PATH = "$scopeSdk\VC\bin;$scopeSdk\SDK\bin;$env:PATH"
 name `Archives`:
 
 ```powershell
-.\build-direct\NativeMapiProbe.exe `
+.\native\bin\x64\Debug\OutlookMapiReader.exe `
   --store-contains Archives `
   --max-folders 25 `
   --max-messages 5
 ```
 
-Probe логинится без `MAPI_LOGON_UI`; если default profile отсутствует или требует
+Reader логинится без `MAPI_LOGON_UI`; если default profile отсутствует или требует
 интерактивного выбора, он завершится с HRESULT вместо показа profile picker.
 
 ### JSONL для Python pipeline
 
 `--jsonl` оставляет на `stdout` только UTF-8 JSON Lines — один объект на сообщение.
 Progress, recoverable errors и итоговый summary направляются в `stderr`, поэтому
-stdout можно безопасно читать построчно из Python без concat всего mailbox:
+stdout можно безопасно перенаправить в файл или читать построчно без concat всего
+mailbox:
 
 ```powershell
-.\build-direct\NativeMapiProbe.exe `
+.\native\bin\x64\Debug\OutlookMapiReader.exe `
   --jsonl `
   --max-folders 100 `
   --max-messages 1000 `
@@ -139,8 +117,8 @@ stdout можно безопасно читать построчно из Python
   --spool-dir C:\Users\User\AppData\Local\RAGSearch\spool `
   --max-attachment-bytes 67108864 `
   --max-total-attachment-bytes 0 `
-  2> probe.log |
-  python .\consume_jsonl.py
+  2> reader.log `
+  > messages.jsonl
 ```
 
 Формат строки (показан развёрнуто только для документации; фактический output —
@@ -177,14 +155,14 @@ stdout можно безопасно читать построчно из Python
 }
 ```
 
-`--body-preview-chars` в этом prototype одновременно является пределом поля `body`;
+`--body-preview-chars` в текущем контракте одновременно является пределом поля `body`;
 hard maximum — `4000000` символов (примерно 8 MiB UTF-16 read buffer).
 Для production ingestion лучше оставить bounded producer/consumer с backpressure,
 а не накапливать весь stdout в памяти вызывающего процесса.
 
 Даты всегда имеют ISO-8601 UTC вид с суффиксом `Z` либо равны JSON `null`.
-`conversation_id` выбирается из `PR_CONVERSATION_ID`, затем
-`PR_CONVERSATION_INDEX`, затем `PR_SEARCH_KEY`; binary value кодируется hex.
+`conversation_id` содержит только `PR_CONVERSATION_ID`; если provider его не
+вернул, поле пустое. Binary value кодируется hex.
 `to`/`cc` — provider display strings (`PR_DISPLAY_TO`/`PR_DISPLAY_CC`), не
 нормализованный список SMTP-адресов.
 
@@ -195,6 +173,42 @@ custom-form и S/MIME письма. `REPORT.*` и `IPM.Schedule.Meeting.*` на�
 предыдущий индексатор принимал только успешный cast `item as Outlook.MailItem`.
 Пропуски не расходуют `--max-messages` и отражаются в summary как
 `skipped_non_mail`.
+
+### Python adapter
+
+Из корня репозитория adapter можно запустить отдельно от VSTO host:
+
+```powershell
+.\service\.venv\Scripts\python.exe .\connectors\outlook_mapi\adapter.py `
+  --executable .\connectors\outlook_mapi\native\bin\x64\Debug\OutlookMapiReader.exe `
+  --full-scan
+```
+
+Adapter читает JSONL потоково, не накапливая mailbox в памяти. Для каждого запуска
+он создаёт собственный помеченный каталог ниже `--spool-dir`, принимает только
+обычные файлы внутри этого каталога и удаляет только принадлежащий ему run.
+Машиночитаемый статус выдаётся строками `RAGSEARCH_PROGRESS {json}`; внешний
+`--cancel-file` позволяет запросить корректную остановку.
+
+### Тесты
+
+Из корня репозитория:
+
+```powershell
+.\service\.venv\Scripts\python.exe -B -m unittest `
+  discover -s connectors\outlook_mapi\tests -t . -v
+
+.\service\.venv\Scripts\python.exe -B `
+  .\connectors\outlook_mapi\adapter.py --help
+```
+
+Live E2E дополнительно читает реальный Outlook profile и ожидает подготовленный
+test store, поэтому запускается отдельно:
+
+```powershell
+powershell.exe -NoProfile -File `
+  .\connectors\outlook_mapi\tests\test_adapter_e2e.ps1
+```
 
 ### Безопасность spool вложений
 
@@ -217,14 +231,18 @@ custom-form и S/MIME письма. `REPORT.*` и `IPM.Schedule.Meeting.*` на�
 
 1. В консоли появились stores, folder paths, Subject/Body preview, EntryID и StoreID.
 2. Outlook Object Model Guard не показал окно согласия.
-3. Outlook продолжил нормально работать параллельно с probe.
+3. Outlook продолжил нормально работать параллельно с reader.
 
 Extended MAPI — отдельный unmanaged API, а не обход/отключение настроенной политики
 Programmatic Access. Итоговое поведение всё равно зависит от доступности MAPI,
 настроек профиля, прав пользователя и корпоративных ограничений. Обзор выбора API:
 <https://learn.microsoft.com/en-us/office/client-developer/outlook/selecting-an-api-or-technology-for-developing-solutions-for-outlook>.
 
-## Результат проверки на этой машине (2026-08-11)
+## Результат проверки на этой машине (2026-08-12)
+
+После clean-break 12 августа 2026 года новый reader собран в раздельные
+`native\bin\x64\Debug` и `native\bin\x64\Release`; connector tests прошли 14/14,
+VSTO Debug Rebuild — с 0 warnings и 0 errors.
 
 - Исходник без warnings скомпилирован и слинкован как x64 console executable.
 - `dumpbin /headers` подтвердил `machine (x64)` и `Windows CUI`; imports содержат
@@ -247,26 +265,24 @@ Programmatic Access. Итоговое поведение всё равно за�
 - Контроль `--max-messages 20` вернул ровно 20 писем, хотя до них/между ними были
   пропущены все 31 non-mail objects: skipped rows лимит emitted mail не уменьшают.
 
-Полный штатный build через установленный Visual Studio сейчас недоступен: на машине
-не установлен workload Desktop development with C++ (`Microsoft.Cpp.Default.props`
-отсутствует), а `cmake` не находится в `PATH`. Для proof использован имеющийся x64
-compiler из bundled ScopeCppSDK и зафиксированные в репозитории headers из
-официального Microsoft MAPIStubLibrary. Готовый проверенный бинарник лежит в
-`build-direct\NativeMapiProbe.exe`.
+Штатный Visual Studio workload Desktop development with C++ установлен.
+Канонический полный `Debug|x64` Rebuild решения и отдельный `Release|x64` Rebuild
+reader выполнены через MSVC v143 с 0 warnings и 0 errors. Для воспроизводимой
+сборки clean clone нужен заявленный C++ workload.
 
-## Ограничения prototype
+## Ограничения
 
 - Используется default profile, а не UI-выбор профиля. Если Outlook запущен с
   не-default profile, это может быть другой mailbox.
 - Не перечисляются associated/hidden contents.
-- Body читается как `PR_BODY_W` stream с ANSI/property fallback. HTML/RTF отдельно не
-  извлекаются.
-- SMTP sender берётся из `PR_SENDER_SMTP_ADDRESS`/sent-representing с fallback на
-  provider email property. Для старых Exchange items fallback может быть legacy EX
-  address, а не SMTP.
+- Body читается как `PR_BODY_W` stream; если provider публикует только ANSI body,
+  используется `PR_BODY_A`. HTML/RTF отдельно не извлекаются.
+- SMTP sender берётся только из `PR_SENDER_SMTP_ADDRESS` либо
+  `PR_SENT_REPRESENTING_SMTP_ADDRESS`; provider-specific EX address не маскируется
+  под SMTP.
 - Вложения embedded-message/OLE/by-reference не разворачиваются; для них остаются
   metadata и пустой `temp_path`.
 - `EntryID` локален для конкретного MAPI profile/store и не является переносимым
   глобальным идентификатором.
-- Ошибки отдельных inaccessible folders/messages считаются recoverable: probe идёт
+- Ошибки отдельных inaccessible folders/messages считаются recoverable: reader идёт
   дальше и возвращает exit code `1`; fatal init/logon errors имеют другие exit codes.

@@ -1,8 +1,8 @@
 # The default runtime and test suite use only the Python 3.11+ standard library.
 #
 # Optional local neural embeddings (never downloaded by the service):
-#   python -m pip install "sentence-transformers>=3.0,<6"
+#   python -m pip install "sentence-transformers==5.7.0"
 #
-# This range is for local experimentation, not a distribution lock. Before
+# This optional version is for local experimentation, not a distribution lock. Before
 # bundling the neural path, pin exact artifacts/hashes and audit every transitive
 # package plus the selected model revision and their LICENSE/NOTICE files.

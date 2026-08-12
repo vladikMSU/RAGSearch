@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
 using System.Runtime.Serialization.Json;
@@ -22,27 +21,9 @@ namespace RAGSearch
 
         public LocalServiceClient()
         {
-            var configuredUrl = Environment.GetEnvironmentVariable("RAGSEARCH_SERVICE_URL");
-            var baseUrl = string.IsNullOrWhiteSpace(configuredUrl)
-                ? "http://127.0.0.1:8765/"
-                : configuredUrl.TrimEnd('/') + "/";
-
-            Uri serviceUri;
-            if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out serviceUri) ||
-                !serviceUri.IsLoopback ||
-                !string.Equals(serviceUri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ||
-                !string.IsNullOrEmpty(serviceUri.UserInfo) ||
-                !string.Equals(serviceUri.AbsolutePath, "/", StringComparison.Ordinal) ||
-                !string.IsNullOrEmpty(serviceUri.Query) ||
-                !string.IsNullOrEmpty(serviceUri.Fragment))
-            {
-                throw new InvalidOperationException(
-                    "RAGSEARCH_SERVICE_URL must be a plain HTTP loopback URL; mail data never leaves this computer.");
-            }
-
             httpClient = new HttpClient
             {
-                BaseAddress = serviceUri,
+                BaseAddress = new Uri("http://127.0.0.1:8765/", UriKind.Absolute),
                 Timeout = TimeSpan.FromMinutes(5)
             };
             tokenPath = Path.Combine(
@@ -62,27 +43,18 @@ namespace RAGSearch
             int limit,
             CancellationToken cancellationToken)
         {
-            return await SearchAsync(
-                    query,
-                    limit,
-                    null,
-                    cancellationToken)
-                .ConfigureAwait(true);
-        }
-
-        public async Task<SearchResponse> SearchAsync(
-            string query,
-            int limit,
-            IDictionary<string, object> filters,
-            CancellationToken cancellationToken)
-        {
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                throw new ArgumentException("Search query must not be empty.", "query");
+            }
+            if (limit < 1 || limit > 100)
+            {
+                throw new ArgumentOutOfRangeException("limit", "Search limit must be between 1 and 100.");
+            }
             var request = new SearchRequest
             {
-                query = query ?? string.Empty,
-                limit = limit,
-                filters = filters == null
-                    ? new Dictionary<string, object>()
-                    : new Dictionary<string, object>(filters)
+                Query = query,
+                Limit = limit
             };
             return await SendAsync<SearchResponse>(
                     HttpMethod.Post,
@@ -111,10 +83,7 @@ namespace RAGSearch
             using (var request = new HttpRequestMessage(method, relativeUrl))
             {
                 var token = ReadToken();
-                if (!string.IsNullOrWhiteSpace(token))
-                {
-                    request.Headers.TryAddWithoutValidation(TokenHeader, token);
-                }
+                request.Headers.TryAddWithoutValidation(TokenHeader, token);
 
                 if (payload != null)
                 {
@@ -136,7 +105,8 @@ namespace RAGSearch
 
                     if (string.IsNullOrWhiteSpace(responseBody))
                     {
-                        return default(T);
+                        throw new InvalidDataException(
+                            "RAGSearch service returned an empty success response.");
                     }
 
                     return Deserialize<T>(responseBody);
@@ -146,25 +116,23 @@ namespace RAGSearch
 
         private string ReadToken()
         {
-            try
+            if (!File.Exists(tokenPath))
             {
-                return File.Exists(tokenPath) ? File.ReadAllText(tokenPath).Trim() : null;
+                throw new FileNotFoundException(
+                    "RAGSearch service token does not exist.",
+                    tokenPath);
             }
-            catch (IOException)
+            var token = File.ReadAllText(tokenPath).Trim();
+            if (string.IsNullOrWhiteSpace(token))
             {
-                return null;
+                throw new InvalidDataException("RAGSearch service token is empty.");
             }
-            catch (UnauthorizedAccessException)
-            {
-                return null;
-            }
+            return token;
         }
 
         private static string Serialize(object payload)
         {
-            var serializer = new DataContractJsonSerializer(
-                payload.GetType(),
-                CreateJsonSettings());
+            var serializer = new DataContractJsonSerializer(payload.GetType());
             using (var stream = new MemoryStream())
             {
                 serializer.WriteObject(stream, payload);
@@ -174,22 +142,11 @@ namespace RAGSearch
 
         private static T Deserialize<T>(string json)
         {
-            var serializer = new DataContractJsonSerializer(
-                typeof(T),
-                CreateJsonSettings());
+            var serializer = new DataContractJsonSerializer(typeof(T));
             using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(json)))
             {
                 return (T)serializer.ReadObject(stream);
             }
-        }
-
-        private static DataContractJsonSerializerSettings CreateJsonSettings()
-        {
-            return new DataContractJsonSerializerSettings
-            {
-                MaxItemsInObjectGraph = int.MaxValue,
-                UseSimpleDictionaryFormat = true
-            };
         }
 
         private static string Compact(string value)

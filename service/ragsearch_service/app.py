@@ -11,6 +11,7 @@ from .database import Database
 from .embeddings import Embedder, create_embedder
 from .errors import ValidationError
 from .security import ensure_private_path, load_or_create_token
+from .timestamps import canonical_utc_timestamp
 
 
 _SEARCH_TOKEN = re.compile(r"[\w@.+-]+", re.UNICODE)
@@ -38,18 +39,23 @@ def _recipients(payload: dict[str, Any], name: str) -> str:
         return ""
     if isinstance(value, str):
         return value
-    if isinstance(value, list) and all(isinstance(item, str) for item in value):
-        return "; ".join(item for item in value if item)
-    raise ValidationError(f"{name} must be a string, string array, or null")
+    raise ValidationError(f"{name} must be a string or null")
 
 
 def _optional_timestamp(payload: dict[str, Any], name: str) -> str | None:
     value = payload.get(name)
-    if value in {None, ""}:
+    if value is None:
         return None
-    if not isinstance(value, str):
-        raise ValidationError(f"{name} must be an ISO-8601 string or null")
-    return value
+    if not isinstance(value, str) or not value:
+        raise ValidationError(
+            f"{name} must be an ISO-8601 timestamp with a UTC offset or null"
+        )
+    try:
+        return canonical_utc_timestamp(value)
+    except ValueError as exc:
+        raise ValidationError(
+            f"{name} must be an ISO-8601 timestamp with a UTC offset or null"
+        ) from exc
 
 
 class SearchService:
@@ -71,6 +77,7 @@ class SearchService:
         self.embedder = embedder or create_embedder(embedding_provider, embedding_model)
         self.database = Database(settings.database_path)
         self.database.initialize()
+        self.database.validate_embedding_model(self.embedder)
         ensure_private_path(settings.database_path)
 
     def health(self) -> dict[str, object]:
@@ -287,7 +294,7 @@ class SearchService:
         minimum_similarity = self.settings.minimum_vector_similarity
         if self.embedder.name.startswith("hashing-"):
             # Cosine distributions are model-specific. The dependency-free
-            # hashing fallback needs a lower floor than a dense semantic model.
+            # The hashing provider needs a lower floor than a dense semantic model.
             minimum_similarity = self.settings.hashing_minimum_vector_similarity
 
         vector_candidates = [
@@ -308,11 +315,6 @@ class SearchService:
         ]
         lexical_matches = [
             item for item in candidates if float(item["lexical_score"]) > 0.0
-        ]
-        lexical_fallback = [
-            item
-            for item in lexical_matches
-            if not bool(item["vector_available"])
         ]
         query_tokens = {
             match.group(0).casefold() for match in _SEARCH_TOKEN.finditer(query)
@@ -379,7 +381,6 @@ class SearchService:
             "candidate_count": len(candidates),
             "eligible_count": len(eligible),
             "lexical_match_count": len(lexical_matches),
-            "lexical_fallback_count": len(lexical_fallback),
             "lexical_gate": lexical_gate,
             "best_vector_similarity": round(best_similarity, 6),
             "best_vector_distance": round(1.0 - best_similarity, 6),

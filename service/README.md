@@ -5,10 +5,13 @@ Dependency-free Python service for Outlook message ingestion and message-level h
 ## Run
 
 Python 3.11 or newer is required. The default provider uses no downloads and no third-party packages.
+The default Windows data layout requires a non-empty `LOCALAPPDATA`; use
+`--data-dir` for an explicit isolated location.
 
 ```powershell
-cd "$env:USERPROFILE\Desktop\projects\RAGSearch\service"
-python -m ragsearch_service
+Push-Location .\service
+.\.venv\Scripts\python.exe -m ragsearch_service
+Pop-Location
 ```
 
 The server binds only to `127.0.0.1:8765`. On first start it creates:
@@ -22,7 +25,9 @@ The token is generated atomically. On Windows the service removes inherited ACEs
 For an isolated development instance:
 
 ```powershell
-python -m ragsearch_service --data-dir .\dev-data --port 8766
+Push-Location .\service
+.\.venv\Scripts\python.exe -m ragsearch_service --data-dir .\dev-data --port 8766
+Pop-Location
 ```
 
 ## API
@@ -74,6 +79,12 @@ Response:
 
 Identity is the composite `(store_id, entry_id)`. Retrying the same item updates it, replaces only that message's chunks/attachments, and removes stale attachments. A bad item does not roll back other items in the batch.
 
+`to` and `cc` are a single canonical string or `null`; recipient arrays are not
+accepted. Each timestamp is either `null` or a non-empty ISO-8601 string with a
+`T` separator and explicit UTC offset (`Z` is accepted). Naive and empty values
+are rejected. The service converts accepted timestamps to fixed-width UTC such
+as `2026-08-11T09:01:00.000000Z` before storing or returning them.
+
 Attachment paths are resolved (including symlinks) and rejected unless they remain inside the configured spool. Text, HTML, JSON/XML/CSV/log/Markdown and DOCX are extracted with the standard library. Unsupported formats remain searchable by message metadata but are recorded as `unsupported`. The default extraction limit is 64 MiB per attachment. Spool files are retained unless `--delete-spool-after-ingest` is explicitly set; with that flag deletion occurs only after commit.
 
 ### Search
@@ -94,8 +105,9 @@ Attachment paths are resolved (including symlinks) and rejected unless they rema
 ```
 
 Supported filters: `store_id`, `store_ids`, `folder_entry_id`, `folder_path`, `folder_path_prefix`, `sender_email`, `received_from`, `received_to`, `has_attachments`.
-The Outlook All Mailboxes projection deliberately sends `filters: {}` so the
-service can return matches from every indexed OST/PST store.
+`received_from` and `received_to` use the same strict timestamp grammar and are
+normalized to UTC before their inclusive comparisons. Omitting `filters` searches
+every indexed OST/PST store.
 
 Response fields are stable for VSTO navigation:
 
@@ -109,9 +121,8 @@ Response fields are stable for VSTO navigation:
       "subject": "Quarterly launch plan",
       "sender_name": "Alex",
       "sender_email": "alex@example.test",
-      "received_at": "2026-08-11T09:01:00Z",
+      "received_at": "2026-08-11T09:01:00.000000Z",
       "folder_path": "\\Mailbox - User\\Inbox",
-      "score": 0.91,
       "hybrid_score": 0.91,
       "lexical_score": 0.74,
       "lexical_match_kind": "token",
@@ -127,7 +138,6 @@ Response fields are stable for VSTO navigation:
   "candidate_count": 42,
   "eligible_count": 7,
   "lexical_match_count": 1,
-  "lexical_fallback_count": 0,
   "lexical_gate": false,
   "cutoff_similarity": 0.67,
   "cutoff_distance": 0.33,
@@ -137,11 +147,11 @@ Response fields are stable for VSTO navigation:
 ```
 
 The service aggregates the best chunk per Outlook message before selecting the
-message candidate pools. `vector_similarity` is the best compatible-model chunk
+message candidate pools. `vector_similarity` is the best indexed chunk
 cosine and `vector_distance = 1 - vector_similarity`. For multi-token queries,
 literal matches are followed by semantic candidates ordered by distance, using
 an adaptive cutoff (`max(model floor, best similarity - 0.10)`) and a hard cap of
-25 messages. The dense-model floor is `0.40`; the hashing fallback uses `0.30`
+25 messages. The dense-model floor is `0.40`; the hashing provider uses `0.30`
 because cosine distributions are model-specific.
 
 Literal retrieval uses both the `unicode61` token index and an FTS5 `trigram`
@@ -150,17 +160,25 @@ prefix/substring hit enables `lexical_gate` and excludes unrelated dense guesses
 for a single-token query any literal hit wins, while a single token with no
 literal evidence returns `mode=single-token-no-literal`. This avoids the observed
 short-query pathology where the multilingual paraphrase model ranked an unrelated
-four-letter body above `киберспорт`. Schema v2 rebuilds the trigram external-content
-index for existing chunks automatically, and `DELETE /v1/index` clears both FTS
-indexes. Sources remain `message_metadata`, `body`, or `attachment:<name>`.
+four-letter body above `киберспорт`. Existing databases must already use schema v3;
+older schemas are rejected at startup and must be rebuilt. `DELETE /v1/index`
+clears both FTS indexes. Sources remain `message_metadata`, `body`, or
+`attachment:<name>`.
 
 ### Stats
 
-`GET /v1/stats` returns message, attachment and chunk counts, extraction status counts, schema version and active embedding metadata.
+`GET /v1/stats` returns message, attachment and chunk counts, extraction status
+counts, schema version, and the active embedding model, dimension, and immutable
+implementation/artifact fingerprint.
 
 ### Clear the local index
 
-`DELETE /v1/index` atomically removes all messages, attachments, chunks and FTS entries from the local database. It keeps the database file, schema, embedding metadata, service token and spool files unchanged, and does not run `VACUUM`. The endpoint requires `X-RAGSearch-Token` like every other `/v1/*` route.
+`DELETE /v1/index` atomically removes all messages, attachments, chunks, FTS
+entries, and embedding contract metadata from the local database. It keeps the
+database file, schema, service token, and spool files unchanged, and does not run
+`VACUUM`. Clearing the embedding metadata is deliberate: the next ingestion fixes
+a new model contract for the now-empty index. The endpoint requires
+`X-RAGSearch-Token` like every other `/v1/*` route.
 
 Response:
 
@@ -177,55 +195,62 @@ The default `hashing-v1-256` provider hashes word, bigram and character features
 An optional locally cached sentence-transformers model can be selected explicitly:
 
 ```powershell
-python -m pip install "sentence-transformers>=3.0,<6"
-python -m ragsearch_service --embedding sentence-transformers --model path\to\local-model
+Push-Location .\service
+.\.venv\Scripts\python.exe -m pip install "sentence-transformers==5.7.0"
+.\.venv\Scripts\python.exe -m ragsearch_service `
+  --embedding sentence-transformers `
+  --model path\to\local-model
+Pop-Location
 ```
 
-`local_files_only=True` is enforced, so starting the service does not download a model. Chunks retain provider name and dimension. Switching providers requires re-ingesting messages to populate matching vectors; FTS5 continues to work for older chunks.
+`local_files_only=True` is enforced, so starting the service does not download a
+model. The first ingestion fixes one provider name, dimension, and immutable
+fingerprint for the whole index. The hashing fingerprint covers its feature
+algorithm and Unicode database version. The neural fingerprint hashes every file
+in the resolved local model snapshot plus the embedding runtime package versions.
+Replacing model weights at the same path therefore cannot silently mix vectors.
+Starting against a non-empty index with another contract fails immediately;
+switch models only after `DELETE /v1/index`, then re-ingest every message.
 
-This workstation also has a preloaded multilingual model at:
+The conventional ignored workspace location for the multilingual model is:
 
 ```text
 <repo-root>\service\models\paraphrase-multilingual-MiniLM-L12-v2
 ```
 
-Run the tested neural configuration from the repository root:
+Run the neural configuration from the repository root:
 
 ```powershell
-.\service\.venv\Scripts\python.exe .\service\run.py `
+Push-Location .\service
+.\.venv\Scripts\python.exe -m ragsearch_service `
   --embedding sentence-transformers `
-  --model .\service\models\paraphrase-multilingual-MiniLM-L12-v2 `
+  --model .\models\paraphrase-multilingual-MiniLM-L12-v2 `
   --delete-spool-after-ingest
+Pop-Location
 ```
 
 The model is loaded with `local_files_only=True`; `service/models/` is intentionally ignored rather than committed. Its model card documents 50-language, 384-dimensional sentence embeddings: [paraphrase-multilingual-MiniLM-L12-v2](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2).
 
-## Native MAPI adapter
+## Outlook MAPI connector
 
-`import_native_mapi.py --full-scan` streams the complete native JSONL contract into
-the service without accumulating the mailbox in memory. It creates a uniquely marked
-run directory below `--spool-dir`, accepts attachment files only when their resolved
-regular-file paths remain inside that directory, and removes only that owned run after
-each import attempt. An external cancellation sentinel can be supplied with
-`--cancel-file`.
-
-Machine-readable status is emitted one line at a time as
-`RAGSEARCH_PROGRESS {json}`. During a full scan `total=0` means that the total is not
-known yet; the final event reports the actual total. Native `body_truncated` values are
-validated and counted in progress/final output. The current service database does not
-persist that flag, so re-ingestion with a larger `--body-preview-chars` limit is needed
-if a truncation count is nonzero.
+Source-specific ingestion is intentionally outside the search service, in
+[`connectors/outlook_mapi`](../connectors/outlook_mapi/README.md). Its adapter streams
+the reader's JSONL contract into this service through the public `/v1/messages` HTTP
+boundary.
 
 ## Tests
 
 ```powershell
-cd "$env:USERPROFILE\Desktop\projects\RAGSearch\service"
-python -m unittest discover -s tests -v
+Push-Location .\service
+.\.venv\Scripts\python.exe -m unittest discover -s tests -t . -v
+Pop-Location
 ```
 
 Tests use explicit temporary data/token/spool directories and do not touch the default `%LOCALAPPDATA%\RAGSearch` state.
 
-The current local suite completes 25 tests; the existing neural prototype database contains 42 Outlook items, 49 attachments and 1,877 chunks with the 384-dimensional provider.
+The service tests are independent from the connector tests and use only explicit
+temporary paths. Connector validation commands are documented in the connector
+README.
 
 ## Scale note
 

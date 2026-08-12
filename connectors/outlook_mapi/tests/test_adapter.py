@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Mapping
 from unittest import mock
 
-import import_native_mapi as adapter
+from connectors.outlook_mapi import adapter
 from ragsearch_service.app import SearchService
 from ragsearch_service.config import Settings
 from ragsearch_service.http_api import create_http_server
@@ -56,12 +56,12 @@ class FakeProcess:
         return self.returncode
 
 
-class NativeMapiAdapterTests(unittest.TestCase):
+class OutlookMapiAdapterTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         root = Path(self.temporary.name)
-        self.executable = root / "NativeMapiProbe.exe"
+        self.executable = root / "OutlookMapiReader.exe"
         self.executable.write_bytes(b"test executable placeholder")
         self.token_path = root / "service-token"
         self.token = "t" * 43
@@ -69,7 +69,7 @@ class NativeMapiAdapterTests(unittest.TestCase):
         self.spool_dir = root / "spool"
         self.spool_dir.mkdir()
 
-    def native_message(self, **changes: object) -> dict[str, object]:
+    def reader_record(self, **changes: object) -> dict[str, object]:
         message: dict[str, object] = {
             "store_id": "store-1",
             "entry_id": "entry-1",
@@ -108,10 +108,16 @@ class NativeMapiAdapterTests(unittest.TestCase):
         arguments.update(changes)
         return arguments
 
-    def test_maps_complete_native_contract_and_attachment(self) -> None:
+    def test_cli_requires_explicit_reader_executable(self) -> None:
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                adapter._parser().parse_args([])
+        self.assertEqual(2, raised.exception.code)
+
+    def test_maps_complete_reader_contract_and_attachment(self) -> None:
         attachment_path = self.spool_dir / "notes.txt"
         attachment_path.write_text("Содержимое вложения", encoding="utf-8")
-        record = self.native_message(
+        record = self.reader_record(
             attachments=[
                 {
                     "name": "notes.txt",
@@ -128,7 +134,7 @@ class NativeMapiAdapterTests(unittest.TestCase):
             ]
         )
 
-        mapped = adapter.map_native_message(
+        mapped = adapter.map_reader_message(
             record,
             maximum_body_chars=1_000,
             spool_dir=self.spool_dir,
@@ -158,22 +164,22 @@ class NativeMapiAdapterTests(unittest.TestCase):
         self.assertEqual(str(attachment_path.resolve()), attachments[0]["temp_path"])
         self.assertEqual("", attachments[1]["temp_path"])
 
-    def test_native_contract_rejects_missing_fields_bad_dates_and_bounds(self) -> None:
+    def test_reader_contract_rejects_missing_fields_bad_dates_and_bounds(self) -> None:
         invalid_records = [
             (
                 {
                     key: value
-                    for key, value in self.native_message().items()
+                    for key, value in self.reader_record().items()
                     if key != "folder_entry_id"
                 },
                 "folder_entry_id",
             ),
-            (self.native_message(entry_id=""), "entry_id"),
-            (self.native_message(sent_at="2026-08-11 09:00:00"), "UTC offset"),
-            (self.native_message(received_at=123), "ISO-8601"),
-            (self.native_message(attachments={}), "array"),
+            (self.reader_record(entry_id=""), "entry_id"),
+            (self.reader_record(sent_at="2026-08-11 09:00:00"), "UTC offset"),
+            (self.reader_record(received_at=123), "ISO-8601"),
+            (self.reader_record(attachments={}), "array"),
             (
-                self.native_message(
+                self.reader_record(
                     attachments=[
                         {
                             "name": "bad.txt",
@@ -190,15 +196,15 @@ class NativeMapiAdapterTests(unittest.TestCase):
             with self.subTest(error=error), self.assertRaisesRegex(
                 adapter.ImportFailure, error
             ):
-                adapter.map_native_message(
+                adapter.map_reader_message(
                     record,
                     maximum_body_chars=1_000,
                     spool_dir=self.spool_dir,
                 )
 
         with self.assertRaisesRegex(adapter.ImportFailure, "exceeds"):
-            adapter.map_native_message(
-                self.native_message(body="x" * 11),
+            adapter.map_reader_message(
+                self.reader_record(body="x" * 11),
                 maximum_body_chars=10,
                 spool_dir=self.spool_dir,
             )
@@ -209,7 +215,7 @@ class NativeMapiAdapterTests(unittest.TestCase):
         directory = self.spool_dir / "directory"
         directory.mkdir()
         for raw_path in (outside, directory, self.spool_dir / "missing.txt"):
-            record = self.native_message(
+            record = self.reader_record(
                 attachments=[
                     {
                         "name": "unsafe.txt",
@@ -220,7 +226,7 @@ class NativeMapiAdapterTests(unittest.TestCase):
                 ]
             )
             with self.subTest(path=raw_path), self.assertRaises(adapter.ImportFailure):
-                adapter.map_native_message(
+                adapter.map_reader_message(
                     record,
                     maximum_body_chars=1_000,
                     spool_dir=self.spool_dir,
@@ -253,8 +259,8 @@ class NativeMapiAdapterTests(unittest.TestCase):
 
     def test_streams_one_post_per_record_with_private_spool_and_progress(self) -> None:
         records = [
-            self.native_message(body_truncated=True),
-            self.native_message(entry_id="entry-2", subject="Second"),
+            self.reader_record(body_truncated=True),
+            self.reader_record(entry_id="entry-2", subject="Second"),
         ]
         process = FakeProcess(
             "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records),
@@ -268,9 +274,9 @@ class NativeMapiAdapterTests(unittest.TestCase):
 
         def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
             popen_calls.append((command, kwargs))
-            native_spool = Path(command[command.index("--spool-dir") + 1])
-            self.assertTrue(native_spool.is_dir())
-            self.assertEqual(self.spool_dir.resolve(), native_spool.parent)
+            connector_spool = Path(command[command.index("--spool-dir") + 1])
+            self.assertTrue(connector_spool.is_dir())
+            self.assertEqual(self.spool_dir.resolve(), connector_spool.parent)
             return process
 
         def fake_open(request: object, *, timeout: int) -> FakeResponse:
@@ -278,7 +284,7 @@ class NativeMapiAdapterTests(unittest.TestCase):
             self.assertEqual(adapter.HTTP_TIMEOUT_SECONDS, timeout)
             return FakeResponse({"accepted": 1, "failed": 0, "errors": []})
 
-        result = adapter.import_native_messages(
+        result = adapter.import_outlook_mapi_messages(
             **self.import_arguments(
                 service_url="http://localhost:8765",
                 max_stores=2,
@@ -292,7 +298,7 @@ class NativeMapiAdapterTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            adapter.ImportResult(imported=2, probe_exit_code=7, bodies_truncated=1),
+            adapter.ImportResult(imported=2, reader_exit_code=7, bodies_truncated=1),
             result,
         )
         command, options = popen_calls[0]
@@ -308,8 +314,8 @@ class NativeMapiAdapterTests(unittest.TestCase):
             "--max-total-attachment-bytes",
         ):
             self.assertIn(option, command)
-        native_spool = Path(command[command.index("--spool-dir") + 1])
-        self.assertFalse(native_spool.exists())
+        connector_spool = Path(command[command.index("--spool-dir") + 1])
+        self.assertFalse(connector_spool.exists())
         self.assertTrue(foreign.exists())
         self.assertEqual(False, options["shell"])
         self.assertIsNone(options["stderr"])
@@ -329,25 +335,47 @@ class NativeMapiAdapterTests(unittest.TestCase):
         )
         self.assertEqual(1, progress[-1]["bodies_truncated"])
 
-    def test_service_rejection_stops_probe_and_cleans_only_owned_run(self) -> None:
+    def test_bom_prefixed_reader_jsonl_is_rejected(self) -> None:
+        process = FakeProcess(
+            "\ufeff" + json.dumps(self.reader_record(), ensure_ascii=False) + "\n"
+        )
+        opener = mock.Mock()
+
+        with self.assertRaisesRegex(adapter.ImportFailure, "invalid JSONL at output line 1"):
+            adapter.import_outlook_mapi_messages(
+                **self.import_arguments(),
+                popen=lambda *args, **kwargs: process,
+                opener=opener,
+            )
+
+        self.assertTrue(process.terminated)
+        opener.assert_not_called()
+        self.assertFalse(
+            any(
+                child.name.startswith(adapter.OWNED_RUN_PREFIX)
+                for child in self.spool_dir.iterdir()
+            )
+        )
+
+    def test_service_rejection_stops_reader_and_cleans_only_owned_run(self) -> None:
         process = FakeProcess("")
-        native_file: Path | None = None
+        connector_file: Path | None = None
         foreign = self.spool_dir / "foreign.txt"
         foreign.write_text("must survive", encoding="utf-8")
 
         def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
-            nonlocal native_file
+            nonlocal connector_file
             run_dir = Path(command[command.index("--spool-dir") + 1])
-            native_file = run_dir / "message" / "notes.txt"
-            native_file.parent.mkdir()
-            native_file.write_text("sensitive", encoding="utf-8")
-            record = self.native_message(
+            connector_file = run_dir / "message" / "notes.txt"
+            connector_file.parent.mkdir()
+            connector_file.write_text("sensitive", encoding="utf-8")
+            record = self.reader_record(
                 attachments=[
                     {
                         "name": "notes.txt",
-                        "size": native_file.stat().st_size,
+                        "size": connector_file.stat().st_size,
                         "content_type": "text/plain",
-                        "temp_path": str(native_file),
+                        "temp_path": str(connector_file),
                     }
                 ]
             )
@@ -355,7 +383,7 @@ class NativeMapiAdapterTests(unittest.TestCase):
             return process
 
         with self.assertRaisesRegex(adapter.ImportFailure, "rejected"):
-            adapter.import_native_messages(
+            adapter.import_outlook_mapi_messages(
                 **self.import_arguments(),
                 popen=fake_popen,
                 opener=lambda *args, **kwargs: FakeResponse(
@@ -364,8 +392,8 @@ class NativeMapiAdapterTests(unittest.TestCase):
             )
 
         self.assertTrue(process.terminated)
-        self.assertIsNotNone(native_file)
-        self.assertFalse(native_file.parent.parent.exists())
+        self.assertIsNotNone(connector_file)
+        self.assertFalse(connector_file.parent.parent.exists())
         self.assertTrue(foreign.exists())
 
     def test_streamed_full_message_and_attachment_match_live_service(self) -> None:
@@ -382,15 +410,15 @@ class NativeMapiAdapterTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         process = FakeProcess("")
-        native_spool: Path | None = None
+        connector_spool: Path | None = None
 
         def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
-            nonlocal native_spool
-            native_spool = Path(command[command.index("--spool-dir") + 1])
-            attachment = native_spool / "message-1" / "notes.txt"
+            nonlocal connector_spool
+            connector_spool = Path(command[command.index("--spool-dir") + 1])
+            attachment = connector_spool / "message-1" / "notes.txt"
             attachment.parent.mkdir()
             attachment.write_text("УникальныйМаркерВложения", encoding="utf-8")
-            record = self.native_message(
+            record = self.reader_record(
                 body="УникальныйНативныйМаркер",
                 attachments=[
                     {
@@ -404,7 +432,7 @@ class NativeMapiAdapterTests(unittest.TestCase):
             process.stdout = io.StringIO(json.dumps(record, ensure_ascii=False) + "\n")
             return process
 
-        result = adapter.import_native_messages(
+        result = adapter.import_outlook_mapi_messages(
             **self.import_arguments(
                 service_url=f"http://127.0.0.1:{server.server_port}",
                 token_path=settings.token_path,
@@ -412,9 +440,9 @@ class NativeMapiAdapterTests(unittest.TestCase):
             popen=fake_popen,
         )
 
-        self.assertEqual(adapter.ImportResult(imported=1, probe_exit_code=0), result)
-        self.assertIsNotNone(native_spool)
-        self.assertFalse(native_spool.exists())
+        self.assertEqual(adapter.ImportResult(imported=1, reader_exit_code=0), result)
+        self.assertIsNotNone(connector_spool)
+        self.assertFalse(connector_spool.exists())
         found = service.search({"query": "УникальныйМаркерВложения", "limit": 1})[
             "results"
         ][0]
@@ -429,7 +457,7 @@ class NativeMapiAdapterTests(unittest.TestCase):
                 ("store-1", "entry-1"),
             ).fetchone()
         self.assertEqual(
-            ("Mailbox", "alex@example.test", "2026-08-11T09:00:00+00:00"),
+            ("Mailbox", "alex@example.test", "2026-08-11T09:00:00.000000Z"),
             tuple(stored),
         )
 
@@ -440,7 +468,7 @@ class NativeMapiAdapterTests(unittest.TestCase):
             commands.append(command)
             return FakeProcess("")
 
-        result = adapter.import_native_messages(
+        result = adapter.import_outlook_mapi_messages(
             **self.import_arguments(
                 max_stores=None,
                 max_folders=None,
@@ -455,17 +483,17 @@ class NativeMapiAdapterTests(unittest.TestCase):
             self.assertEqual("0", command[command.index(option) + 1])
 
         with self.assertRaisesRegex(adapter.ImportFailure, "cannot be combined"):
-            adapter.import_native_messages(
+            adapter.import_outlook_mapi_messages(
                 **self.import_arguments(full_scan=True),
                 popen=fake_popen,
             )
 
-    def test_cancel_sentinel_avoids_starting_probe_and_cleans_run(self) -> None:
+    def test_cancel_sentinel_avoids_starting_reader_and_cleans_run(self) -> None:
         cancel_file = Path(self.temporary.name) / "cancel"
         cancel_file.write_text("cancel", encoding="ascii")
         progress: list[Mapping[str, object]] = []
         with self.assertRaises(adapter.ImportCancelled):
-            adapter.import_native_messages(
+            adapter.import_outlook_mapi_messages(
                 **self.import_arguments(),
                 cancel_file=cancel_file,
                 progress=progress.append,
@@ -493,13 +521,13 @@ class NativeMapiAdapterTests(unittest.TestCase):
             json.loads(line.removeprefix(adapter.PROGRESS_PREFIX)),
         )
 
-    def test_main_propagates_native_exit_code_and_progress_callback(self) -> None:
+    def test_main_propagates_reader_exit_code_and_progress_callback(self) -> None:
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()), mock.patch.object(
             adapter,
-            "import_native_messages",
-            return_value=adapter.ImportResult(imported=3, probe_exit_code=17),
+            "import_outlook_mapi_messages",
+            return_value=adapter.ImportResult(imported=3, reader_exit_code=17),
         ) as importer:
-            exit_code = adapter.main([])
+            exit_code = adapter.main(["--executable", str(self.executable)])
 
         self.assertEqual(17, exit_code)
         self.assertIs(importer.call_args.kwargs["progress"], adapter.write_progress)
@@ -511,10 +539,15 @@ class NativeMapiAdapterTests(unittest.TestCase):
 
         with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()), mock.patch.object(
             adapter,
-            "import_native_messages",
-            return_value=adapter.ImportResult(imported=0, probe_exit_code=0),
+            "import_outlook_mapi_messages",
+            return_value=adapter.ImportResult(imported=0, reader_exit_code=0),
         ) as full_importer:
-            self.assertEqual(0, adapter.main(["--full-scan"]))
+            self.assertEqual(
+                0,
+                adapter.main(
+                    ["--executable", str(self.executable), "--full-scan"]
+                ),
+            )
         self.assertTrue(full_importer.call_args.kwargs["full_scan"])
         self.assertIsNone(full_importer.call_args.kwargs["max_messages"])
         self.assertEqual(
@@ -524,11 +557,21 @@ class NativeMapiAdapterTests(unittest.TestCase):
 
     def test_cli_rejects_unlimited_numeric_limits_and_mixed_full_scan(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
-            adapter._parser().parse_args(["--max-messages", "0"])
+            adapter._parser().parse_args(
+                ["--executable", str(self.executable), "--max-messages", "0"]
+            )
         self.assertEqual(2, raised.exception.code)
 
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
-            adapter.main(["--full-scan", "--max-messages", "10"])
+            adapter.main(
+                [
+                    "--executable",
+                    str(self.executable),
+                    "--full-scan",
+                    "--max-messages",
+                    "10",
+                ]
+            )
         self.assertEqual(2, raised.exception.code)
 
 

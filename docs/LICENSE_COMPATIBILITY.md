@@ -28,11 +28,11 @@ RAGSearch для Windows без передачи прав на first-party ис�
 | 6 headers Microsoft MAPIStubLibrary | Да, `third_party/MAPIStubLibrary` | MIT, pinned commit `a9505d7…` | Да. Разрешены использование, изменение, распространение и продажа; copyright и полный MIT-текст нужно сохранить в исходной и бинарной поставке. Сами headers остаются MIT. |
 | `Microsoft.Office.Tools.Common.v4.0.Utilities.dll` и `Microsoft.Office.Tools.Outlook.v4.0.Utilities.dll` | Да, копируются в VSTO output без изменений | Microsoft Visual Studio redistributables | Да, только без изменений и с соблюдением применимых условий лицензии Visual Studio. Это не first-party DLL. |
 | .NET Framework, VSTO Runtime, Windows, classic Outlook и установленный MAPI provider | Нет, внешние prerequisites | Условия Microsoft для соответствующих продуктов | Лицензия RAGSearch на них не распространяется. Пользователь/организация должны иметь законные установки; их нельзя молча включить в свой installer как собственные файлы. |
-| `MAPI32.lib`/`Ole32.lib`, MSVC и Windows SDK | Используются при сборке; import libraries не поставляются как часть RAGSearch | Условия Windows SDK/Visual Studio | Готовый native EXE может быть proprietary. Текущий Release EXE статически включает MSVC runtime code; право использовать toolchain и распространять результат определяется условиями лицензированной редакции Visual Studio/SDK. |
+| `MAPI32.lib`/`Ole32.lib`, MSVC и Windows SDK | Используются при сборке; import libraries не поставляются как часть RAGSearch | Условия Windows SDK/Visual Studio | Готовый native EXE может быть proprietary. Право использовать toolchain и распространять результат, включая применимый MSVC runtime, определяется условиями лицензированной редакции Visual Studio/SDK. |
 | Python interpreter и standard library | Не включены; пользователь устанавливает Python отдельно | PSF License и notices incorporated software | Текущая поставка не перераспространяет Python. Если позже встроить interpreter, нужно приложить весь Python license stack и notices точной версии. |
-| `sentence-transformers` и транзитивные packages | Не включены; только необязательная ручная установка | Прямой проект — Apache-2.0, но dependency range не закреплён | Apache-2.0 сама по себе допускает proprietary/commercial use, но текущий транзитивный набор не зафиксирован и не прошёл полный distribution audit. Не включать в коммерческий installer до lock/SBOM/notices-аудита. |
+| `sentence-transformers` и транзитивные packages | Не включены; только необязательная ручная установка | Прямой пакет `5.7.0` — Apache-2.0, транзитивный lock отсутствует | Apache-2.0 сама по себе допускает proprietary/commercial use, но текущий транзитивный набор не зафиксирован и не прошёл полный distribution audit. Не включать в коммерческий installer до lock/SBOM/notices-аудита. |
 | `paraphrase-multilingual-MiniLM-L12-v2` | Не включена и не скачивается автоматически | В model card указана Apache-2.0 | В принципе permissive, но перед поставкой нужно закрепить точную revision, сохранить LICENSE/model card и отдельно оценить происхождение данных/модели; license tag не является гарантией отсутствия иных рисков. |
-| CMake, PowerShell и Visual Studio | Только build tools | Их собственные условия | Их лицензии обычно не переходят на результат сборки, но сама организация обязана иметь право пользоваться выбранной редакцией инструмента. Для Visual Studio Community есть ограничения по типу и размеру организации. |
+| PowerShell и Visual Studio | Только build tools | Их собственные условия | Их лицензии обычно не переходят на результат сборки, но сама организация обязана иметь право пользоваться выбранной редакцией инструмента. Для Visual Studio Community есть ограничения по типу и размеру организации. |
 
 ## Блокеры и неизвестные перед коммерческим релизом
 
@@ -47,10 +47,10 @@ RAGSearch для Windows без передачи прав на first-party ис�
    требуемом лицензией Visual Studio объёме, запрещать ложное представление
    Microsoft ownership/endorsement и не накладывать на DLL несовместимую
    `Excluded License`. Это нужно согласовать вместе с first-party EULA.
-3. **Release toolchain.** Нынешний локальный native EXE — проверочный dev artifact,
-   собранный не штатным v143 `.vcxproj`; он не входит в Git и не считается очищенным
-   release binary. Коммерческий EXE нужно заново собрать штатной поддерживаемой
-   toolchain под действующей лицензией и повторно записать imports/CRT/SBOM.
+3. **Release toolchain.** Локальные Debug/Release native EXE собраны штатным MSVC
+   v143 `.vcxproj`, но не входят в Git, не имеют Authenticode-подписи и остаются
+   проверочными dev artifacts. Для коммерческой поставки нужно повторить сборку
+   лицензированной toolchain и зафиксировать imports/CRT/SBOM поставляемого binary.
 4. **Подпись релиза.** Автоматически создаваемый self-signed VSTO certificate и
    неподписанные DLL/EXE годятся только для разработки. Для внешнего релиза нужны
    production code-signing certificate, installer и политика доверия. Это не
@@ -82,7 +82,7 @@ RAGSearch для Windows без передачи прав на first-party ис�
 
 ## Что сделать перед включением neural-контура
 
-1. Выбрать конкретные Python и `sentence-transformers` versions.
+1. Выбрать конкретную Python version и подтвердить `sentence-transformers==5.7.0`.
 2. Создать lock с hashes и SBOM для всех wheels/native libraries.
 3. Собрать LICENSE/NOTICE для каждой транзитивной зависимости, включая bundled
    компоненты NumPy/SciPy/PyTorch.

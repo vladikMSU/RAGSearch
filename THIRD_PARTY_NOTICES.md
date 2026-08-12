@@ -6,7 +6,8 @@ scoped commercial-compatibility audit at `docs/LICENSE_COMPATIBILITY.md`.
 
 ## Microsoft MAPIStubLibrary
 
-RAGSearch vendors the minimal header subset required by `native-mapi-probe` from:
+RAGSearch vendors the minimal header subset required by
+`connectors/outlook_mapi/native/OutlookMapiReader` from:
 
 - project: <https://github.com/microsoft/MAPIStubLibrary>
 - commit: `a9505d73351554078431fc950a0bc34ada6fe39b`
@@ -51,8 +52,9 @@ notices and incorporated-software notices for the exact Python version.
 
 `sentence-transformers`, its transitive dependencies, and
 `paraphrase-multilingual-MiniLM-L12-v2` are optional, ignored by Git and never
-downloaded automatically. The direct package and model currently identify as
-Apache-2.0, but the dependency range and model revision are not pinned. They are
+downloaded automatically. The optional direct package version is selected as
+`sentence-transformers==5.7.0`, and the package/model identify as Apache-2.0, but
+transitive artifacts, hashes and the model revision are not locked. They are
 therefore outside the cleared default distribution set; audit the exact lock,
 native wheels and model revision before bundling them.
 

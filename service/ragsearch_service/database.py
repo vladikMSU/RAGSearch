@@ -13,9 +13,10 @@ from typing import Any
 from .chunking import normalize_text
 from .embeddings import Embedder, blob_to_vector, cosine_for_normalized, vector_to_blob
 from .errors import ValidationError
+from .timestamps import canonical_utc_timestamp
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SEARCH_TOKEN = re.compile(r"[\w@.+-]+", re.UNICODE)
 
 
@@ -52,11 +53,20 @@ class Database:
             connection.close()
 
     def initialize(self) -> None:
+        fresh_database = not self.path.exists()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.session() as connection:
-            previous_schema_version = int(
+            schema_version = int(
                 connection.execute("PRAGMA user_version").fetchone()[0]
             )
+            if schema_version != SCHEMA_VERSION and not (
+                fresh_database and schema_version == 0
+            ):
+                raise RuntimeError(
+                    "Unsupported database schema version "
+                    f"{schema_version}; expected {SCHEMA_VERSION}. "
+                    "Delete the database file and rebuild the local index."
+                )
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
@@ -119,13 +129,14 @@ class Database:
                     embedding BLOB NOT NULL,
                     embedding_model TEXT NOT NULL,
                     embedding_dim INTEGER NOT NULL,
+                    embedding_fingerprint TEXT NOT NULL,
                     UNIQUE (message_id, source_key, ordinal)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_chunks_message
                     ON chunks (message_id);
                 CREATE INDEX IF NOT EXISTS idx_chunks_embedding
-                    ON chunks (embedding_model, embedding_dim);
+                    ON chunks (embedding_model, embedding_dim, embedding_fingerprint);
 
                 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
                     text,
@@ -173,17 +184,63 @@ class Database:
                 );
                 """
             )
-            if previous_schema_version < 2:
-                # External-content FTS indexes do not backfill themselves when
-                # first added to an existing database.
-                connection.execute(
-                    "INSERT INTO chunks_trigram(chunks_trigram) VALUES ('rebuild')"
-                )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def ping(self) -> bool:
         with self.session() as connection:
             return connection.execute("SELECT 1").fetchone()[0] == 1
+
+    @staticmethod
+    def _validate_embedding_contract(
+        connection: sqlite3.Connection,
+        embedder: Embedder,
+    ) -> bool:
+        meta = {
+            row["key"]: row["value"]
+            for row in connection.execute(
+                "SELECT key, value FROM service_meta "
+                "WHERE key IN ('embedding_model', 'embedding_dim', 'embedding_fingerprint')"
+            )
+        }
+        indexed_models = list(
+            connection.execute(
+                "SELECT DISTINCT embedding_model, embedding_dim, embedding_fingerprint "
+                "FROM chunks LIMIT 2"
+            )
+        )
+        if not meta and not indexed_models:
+            return False
+
+        expected_model = embedder.name
+        expected_dim = str(embedder.dimensions)
+        expected_fingerprint = embedder.fingerprint
+        valid_meta = (
+            meta.get("embedding_model") == expected_model
+            and meta.get("embedding_dim") == expected_dim
+            and meta.get("embedding_fingerprint") == expected_fingerprint
+        )
+        valid_chunks = not indexed_models or (
+            len(indexed_models) == 1
+            and indexed_models[0]["embedding_model"] == expected_model
+            and str(indexed_models[0]["embedding_dim"]) == expected_dim
+            and indexed_models[0]["embedding_fingerprint"] == expected_fingerprint
+        )
+        if not valid_meta or not valid_chunks:
+            actual_models = ", ".join(
+                f"{row['embedding_model']}:{row['embedding_dim']}:{row['embedding_fingerprint']}"
+                for row in indexed_models
+            ) or "no chunks"
+            raise RuntimeError(
+                "The index embedding contract does not match the configured embedder "
+                f"{expected_model}:{expected_dim}:{expected_fingerprint} "
+                f"(stored: {actual_models}). "
+                "Clear the index and re-ingest it with one embedding model."
+            )
+        return True
+
+    def validate_embedding_model(self, embedder: Embedder) -> None:
+        with self.session() as connection:
+            self._validate_embedding_contract(connection, embedder)
 
     def clear_index(self) -> dict[str, int]:
         """Delete indexed Outlook data atomically while keeping the database itself."""
@@ -204,6 +261,7 @@ class Database:
             connection.execute(
                 "INSERT INTO chunks_trigram(chunks_trigram) VALUES ('rebuild')"
             )
+            connection.execute("DELETE FROM service_meta")
 
         return {
             "deleted_messages": counts["messages"],
@@ -222,6 +280,24 @@ class Database:
         now = _utc_now()
         with self.session() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            has_embedding_contract = self._validate_embedding_contract(
+                connection,
+                embedder,
+            )
+            if not has_embedding_contract:
+                connection.execute(
+                    "INSERT INTO service_meta(key, value) VALUES ('embedding_model', ?)",
+                    (embedder.name,),
+                )
+                connection.execute(
+                    "INSERT INTO service_meta(key, value) VALUES ('embedding_dim', ?)",
+                    (str(embedder.dimensions),),
+                )
+                connection.execute(
+                    "INSERT INTO service_meta(key, value) "
+                    "VALUES ('embedding_fingerprint', ?)",
+                    (embedder.fingerprint,),
+                )
             connection.execute(
                 """
                 INSERT INTO messages (
@@ -309,8 +385,9 @@ class Database:
                     """
                     INSERT INTO chunks (
                         message_id, attachment_id, source_key, source_kind, source_label,
-                        ordinal, text, text_hash, embedding, embedding_model, embedding_dim
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ordinal, text, text_hash, embedding, embedding_model,
+                        embedding_dim, embedding_fingerprint
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message_id,
@@ -324,17 +401,9 @@ class Database:
                         vector_to_blob(chunk["embedding"]),
                         embedder.name,
                         embedder.dimensions,
+                        embedder.fingerprint,
                     ),
                 )
-
-            connection.execute(
-                "INSERT OR REPLACE INTO service_meta(key, value) VALUES ('embedding_model', ?)",
-                (embedder.name,),
-            )
-            connection.execute(
-                "INSERT OR REPLACE INTO service_meta(key, value) VALUES ('embedding_dim', ?)",
-                (str(embedder.dimensions),),
-            )
 
     def _filters(self, filters: object) -> tuple[str, list[object]]:
         if filters is None:
@@ -391,18 +460,22 @@ class Database:
             clauses.append("LOWER(m.sender_email) = LOWER(?)")
             parameters.append(sender_email)
 
-        received_from = filters.get("received_from")
-        if received_from is not None:
-            if not isinstance(received_from, str):
-                raise ValidationError("filters.received_from must be a string")
-            clauses.append("m.received_at >= ?")
-            parameters.append(received_from)
-        received_to = filters.get("received_to")
-        if received_to is not None:
-            if not isinstance(received_to, str):
-                raise ValidationError("filters.received_to must be a string")
-            clauses.append("m.received_at <= ?")
-            parameters.append(received_to)
+        for name, operator in (("received_from", ">="), ("received_to", "<=")):
+            if name not in filters:
+                continue
+            value = filters[name]
+            if not isinstance(value, str) or not value:
+                raise ValidationError(
+                    f"filters.{name} must be an ISO-8601 timestamp with a UTC offset"
+                )
+            try:
+                canonical = canonical_utc_timestamp(value)
+            except ValueError as exc:
+                raise ValidationError(
+                    f"filters.{name} must be an ISO-8601 timestamp with a UTC offset"
+                ) from exc
+            clauses.append(f"m.received_at {operator} ?")
+            parameters.append(canonical)
 
         has_attachments = filters.get("has_attachments")
         if has_attachments is not None:
@@ -530,6 +603,7 @@ class Database:
                     continue
                 lexical_sql = f"""
                     SELECT {select_fields}, c.embedding, c.embedding_model, c.embedding_dim,
+                           c.embedding_fingerprint,
                            bm25({table_name}) AS lexical_rank
                     FROM {table_name}
                     JOIN chunks c ON c.id = {table_name}.rowid
@@ -563,7 +637,11 @@ class Database:
                 payload["vector_available"] = False
                 try:
                     stored = blob_to_vector(row["embedding"], int(row["embedding_dim"]))
-                    if row["embedding_model"] == embedder.name and len(stored) == len(query_vector):
+                    if (
+                        row["embedding_model"] == embedder.name
+                        and row["embedding_fingerprint"] == embedder.fingerprint
+                        and len(stored) == len(query_vector)
+                    ):
                         payload["vector"] = min(
                             1.0,
                             max(0.0, cosine_for_normalized(query_vector, stored)),
@@ -577,9 +655,15 @@ class Database:
                 SELECT {select_fields}, c.embedding
                 FROM chunks c
                 JOIN messages m ON m.id = c.message_id
-                WHERE c.embedding_model = ? AND c.embedding_dim = ? {filter_sql}
+                WHERE c.embedding_model = ? AND c.embedding_dim = ?
+                  AND c.embedding_fingerprint = ? {filter_sql}
             """
-            vector_parameters = [embedder.name, embedder.dimensions, *filter_parameters]
+            vector_parameters = [
+                embedder.name,
+                embedder.dimensions,
+                embedder.fingerprint,
+                *filter_parameters,
+            ]
             best_vector_chunk_by_message: dict[
                 int, tuple[float, int, sqlite3.Row]
             ] = {}
@@ -694,10 +778,6 @@ class Database:
                 6,
             )
             result["hybrid_score"] = round(hybrid_score, 6)
-            # Keep the old field for API compatibility. New consumers should use
-            # vector_distance for ordering and hybrid_score for diagnostics.
-            result["score"] = result["hybrid_score"]
-
         results.sort(
             key=lambda result: (
                 0 if bool(result["vector_available"]) else 1,
@@ -769,4 +849,5 @@ class Database:
             "schema_version": SCHEMA_VERSION,
             "embedding_model": meta.get("embedding_model"),
             "embedding_dim": int(meta["embedding_dim"]) if "embedding_dim" in meta else None,
+            "embedding_fingerprint": meta.get("embedding_fingerprint"),
         }

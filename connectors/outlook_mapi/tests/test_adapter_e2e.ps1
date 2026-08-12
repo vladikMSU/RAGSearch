@@ -4,12 +4,12 @@ function Quote-Path([string]$Value) {
     return '"' + $Value.Replace('"', '""') + '"'
 }
 
-$testRoot = Join-Path $env:TEMP ('RAGSearch-MapiAdapter-E2E-' + [Guid]::NewGuid().ToString('N'))
-$workspace = Split-Path -Parent $PSScriptRoot
+$testRoot = Join-Path $env:TEMP ('RAGSearch-OutlookMapiConnector-E2E-' + [Guid]::NewGuid().ToString('N'))
+$workspace = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..\..')).Path
 $python = Join-Path $workspace 'service\.venv\Scripts\python.exe'
-$service = Join-Path $workspace 'service\run.py'
-$adapter = Join-Path $workspace 'service\import_native_mapi.py'
-$probe = Join-Path $workspace 'native-mapi-probe\build-direct\NativeMapiProbe.exe'
+$serviceDirectory = Join-Path $workspace 'service'
+$adapter = Join-Path $workspace 'connectors\outlook_mapi\adapter.py'
+$reader = Join-Path $workspace 'connectors\outlook_mapi\native\bin\x64\Debug\OutlookMapiReader.exe'
 $data = Join-Path $testRoot 'data'
 $spool = Join-Path $testRoot 'spool'
 $token = Join-Path $testRoot 'service-token'
@@ -19,13 +19,14 @@ $process = $null
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 try {
     $arguments = @(
-        (Quote-Path $service)
+        '-m', 'ragsearch_service'
         '--port', $port
         '--data-dir', (Quote-Path $data)
         '--spool-dir', (Quote-Path $spool)
         '--token-path', (Quote-Path $token)
     ) -join ' '
-    $process = Start-Process $python -ArgumentList $arguments -WindowStyle Hidden -PassThru
+    $process = Start-Process $python -ArgumentList $arguments `
+        -WorkingDirectory $serviceDirectory -WindowStyle Hidden -PassThru
 
     $ready = $false
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
@@ -44,7 +45,7 @@ try {
     }
 
     & $python $adapter `
-        --executable $probe `
+        --executable $reader `
         --service-url "http://127.0.0.1:$port" `
         --token-path $token `
         --spool-dir $spool `
@@ -69,7 +70,7 @@ try {
         throw "Adapter left $($spoolLeftovers.Count) item(s) in its temporary spool."
     }
     $stats | ConvertTo-Json -Depth 5
-    Write-Output 'NATIVE_MAPI_ADAPTER_E2E=PASS'
+    Write-Output 'OUTLOOK_MAPI_CONNECTOR_E2E=PASS'
 }
 finally {
     if ($null -ne $process -and -not $process.HasExited) {
@@ -80,7 +81,7 @@ finally {
     if (Test-Path -LiteralPath $testRoot) {
         $resolved = (Resolve-Path -LiteralPath $testRoot).Path
         $temporaryRoot = (Resolve-Path -LiteralPath $env:TEMP).Path.TrimEnd('\')
-        $expectedPrefix = $temporaryRoot + '\RAGSearch-MapiAdapter-E2E-'
+        $expectedPrefix = $temporaryRoot + '\RAGSearch-OutlookMapiConnector-E2E-'
         if (-not $resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Refusing to clean unexpected path: $resolved"
         }

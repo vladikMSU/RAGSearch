@@ -17,8 +17,8 @@ RAGSearch **не проецирует** результаты в штатный �
 ## Поток запроса и отображения
 
 1. Пользователь вводит запрос в нижней панели и нажимает **«Найти»** или `Enter`.
-2. VSTO отправляет `/v1/search` с `filters: {}` и `limit: 25`. Пустые filters
-   означают весь локальный индекс, а не текущую папку Outlook.
+2. VSTO отправляет `/v1/search` с текстом запроса и `limit: 25`. Поиск идёт по
+   всему локальному индексу, а не только по текущей папке Outlook.
 3. Service возвращает уже ранжированный массив `results`.
 4. `SearchPaneControl.PopulateResults` последовательно добавляет элементы массива
    в таблицу. Дополнительной клиентской сортировки нет; сортировка колонок
@@ -36,10 +36,10 @@ input, buttons и settings menu используют согласованные 
 
 Основная реализация:
 
-- [`SearchLimit` и построение UI](../RAGSearch/SearchPaneControl.cs#L14);
-- [`SearchAsync`](../RAGSearch/SearchPaneControl.cs#L632);
-- [`PopulateResults`](../RAGSearch/SearchPaneControl.cs#L733);
-- [нижнее размещение Custom Task Pane](../RAGSearch/ThisAddIn.cs#L58).
+- [`SearchLimit` и построение UI](../hosts/outlook_vsto/SearchPaneControl.cs#L14);
+- [`SearchAsync`](../hosts/outlook_vsto/SearchPaneControl.cs#L798);
+- [`PopulateResults`](../hosts/outlook_vsto/SearchPaneControl.cs#L898);
+- [нижнее размещение Custom Task Pane](../hosts/outlook_vsto/ThisAddIn.cs#L40).
 
 ## Exact identity и открытие оригинала
 
@@ -48,13 +48,13 @@ Search response возвращает для каждого письма сохр
 Outlook UI/STA thread:
 
 ```csharp
-session.GetItemFromID(result.entry_id, result.store_id);
+session.GetItemFromID(result.EntryId, result.StoreId);
 ```
 
 Полученный `MailItem` открывается через `Display(false)` в настоящем окне Outlook.
 Так открывается именно выбранная backend-строка, даже если одинаковая тема есть в
 нескольких папках или stores. Реализация находится в
-[`ThisAddIn.OpenSearchResult`](../RAGSearch/ThisAddIn.cs#L115).
+[`ThisAddIn.OpenSearchResult`](../hosts/outlook_vsto/ThisAddIn.cs#L93).
 
 Точность относится к состоянию store на момент индексации. Если письмо после этого
 переместили, удалили либо отключили его PST, Outlook может больше не разрешить
@@ -77,7 +77,7 @@ Inbox, Sent и PST `Archives`, но не удовлетворяет требов
 - бинарные `StoreID + EntryID` нельзя выразить как поддержанное AQS equality;
 - порядок OR-условий не управляет строками — Outlook сортирует rowset сам;
 - последующий `CurrentView.Filter` не ограничил агрегированную таблицу (в live
-  probe осталось 14/14 строк);
+  проверке осталось 14/14 строк);
 - AQS property syntax зависела от locale/provider: `System.Subject:=...` на
   проверенной ru-RU Windows + en-US Outlook вернул пустую выдачу.
 
@@ -98,7 +98,7 @@ Inbox, Sent и PST `Archives`, но не удовлетворяет требов
 Сервис агрегирует лучший chunk на уровне сообщения до top-K. Для фразы он
 объединяет literal FTS hits с semantic candidates, сортирует vector-часть по
 `vector_distance = 1 - cosine_similarity`, применяет model-specific floor и
-adaptive window. UI не переоценивает score и не переставляет результаты.
+adaptive window. UI не пересчитывает ranking и не переставляет результаты.
 
 Для одиночного слова действует защита от наблюдавшейся патологии multilingual
 embedding model:
@@ -110,10 +110,10 @@ embedding model:
 - если literal hit отсутствует, single-token semantic guess не показывается.
 
 Поэтому `киберспорт`, `кибер` и `спорт` находят индексированное `киберспорт`, даже
-если dense model ставит короткое нерелевантное слово выше. Schema v2 автоматически
-rebuild-ит trigram FTS для существующих chunks; повторно читать PST/OST не требуется.
+если dense model ставит короткое нерелевантное слово выше. Service требует schema
+v3; более старую локальную БД нужно удалить и заново построить из PST/OST.
 
-## Документация Microsoft для проверенного legacy-пути
+## Документация Microsoft для отвергнутого пути
 
 - [Explorer.Search](https://learn.microsoft.com/en-us/office/vba/api/outlook.explorer.search)
 - [OlSearchScope](https://learn.microsoft.com/en-us/office/vba/api/outlook.olsearchscope)

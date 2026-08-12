@@ -1,7 +1,7 @@
 # Microsoft MAPIStubLibrary headers
 
 This directory vendors the Extended MAPI headers required to compile
-`native-mapi-probe` from a clean checkout.
+`connectors/outlook_mapi/native/OutlookMapiReader` from a clean checkout.
 
 - Upstream: <https://github.com/microsoft/MAPIStubLibrary>
 - Commit: `a9505d73351554078431fc950a0bc34ada6fe39b`
@@ -9,7 +9,7 @@ This directory vendors the Extended MAPI headers required to compile
 - Retrieved: 2026-08-12
 - License: MIT; see [`LICENSE`](LICENSE)
 - Vendored content: the minimal transitive header set required by
-  `native-mapi-probe` and the upstream `LICENSE`
+  `OutlookMapiReader` and the upstream `LICENSE`
 
 Vendored headers:
 
@@ -29,4 +29,4 @@ To refresh this dependency intentionally:
 1. Select and record an upstream commit.
 2. Replace the six listed headers and `LICENSE` with files from that exact commit.
 3. Update the commit and retrieval date above.
-4. Rebuild `native-mapi-probe` and run the Python/native adapter tests.
+4. Rebuild `OutlookMapiReader` and run the Outlook MAPI connector tests.

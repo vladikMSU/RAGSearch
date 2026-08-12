@@ -7,9 +7,11 @@ from pathlib import Path
 
 def _default_local_app_data() -> Path:
     configured = os.environ.get("LOCALAPPDATA")
-    if configured:
-        return Path(configured)
-    return Path.home() / "AppData" / "Local"
+    if configured is None or not configured.strip():
+        raise RuntimeError(
+            "LOCALAPPDATA is required for the default RAGSearch data directory"
+        )
+    return Path(configured)
 
 
 @dataclass(frozen=True)

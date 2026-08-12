@@ -15,8 +15,7 @@ namespace RAGSearch
         private const int EmSetCueBanner = 0x1501;
 
         private readonly LocalServiceClient serviceClient;
-        private readonly OomGuardProbe oomGuardProbe;
-        private readonly NativeImportRunner nativeImportRunner;
+        private readonly OutlookMapiImportRunner outlookMapiImportRunner;
         private readonly Action<SearchResultDto> openSearchResult;
         private readonly Action<bool> setPaneCollapsed;
         private readonly Func<bool> togglePaneFloating;
@@ -38,7 +37,6 @@ namespace RAGSearch
         private readonly ToolStripMenuItem indexButton;
         private readonly ToolStripMenuItem stopButton;
         private readonly ToolStripMenuItem resetIndexButton;
-        private readonly ToolStripMenuItem debugOomButton;
         private readonly List<Font> ownedFonts = new List<Font>();
         private readonly Font subjectFont;
         private CancellationTokenSource searchCancellation;
@@ -49,20 +47,17 @@ namespace RAGSearch
         private bool columnWidthsCustomized;
         private bool paneFloating;
         private bool paneCollapsed;
-        private bool probeRunning;
         private bool resetRunning;
 
         public SearchPaneControl(
             LocalServiceClient serviceClient,
-            OomGuardProbe oomGuardProbe,
-            NativeImportRunner nativeImportRunner,
+            OutlookMapiImportRunner outlookMapiImportRunner,
             Action<SearchResultDto> openSearchResult,
             Action<bool> setPaneCollapsed,
             Func<bool> togglePaneFloating)
         {
             this.serviceClient = serviceClient ?? throw new ArgumentNullException("serviceClient");
-            this.oomGuardProbe = oomGuardProbe ?? throw new ArgumentNullException("oomGuardProbe");
-            this.nativeImportRunner = nativeImportRunner ?? throw new ArgumentNullException("nativeImportRunner");
+            this.outlookMapiImportRunner = outlookMapiImportRunner ?? throw new ArgumentNullException("outlookMapiImportRunner");
             this.openSearchResult = openSearchResult ?? throw new ArgumentNullException("openSearchResult");
             this.setPaneCollapsed = setPaneCollapsed ?? throw new ArgumentNullException("setPaneCollapsed");
             this.togglePaneFloating = togglePaneFloating ?? throw new ArgumentNullException("togglePaneFloating");
@@ -141,8 +136,6 @@ namespace RAGSearch
             stopButton.Click += StopButtonOnClick;
             resetIndexButton = new ToolStripMenuItem("Очистить локальный индекс...");
             resetIndexButton.Click += ResetIndexButtonOnClick;
-            debugOomButton = new ToolStripMenuItem("Диагностика Outlook Guard");
-            debugOomButton.Click += DebugOomButtonOnClick;
             settingsMenu.Items.Add(collapsePaneMenuButton);
             settingsMenu.Items.Add(detachPaneMenuButton);
             settingsMenu.Items.Add(new ToolStripSeparator());
@@ -150,8 +143,6 @@ namespace RAGSearch
             settingsMenu.Items.Add(stopButton);
             settingsMenu.Items.Add(new ToolStripSeparator());
             settingsMenu.Items.Add(resetIndexButton);
-            settingsMenu.Items.Add(new ToolStripSeparator());
-            settingsMenu.Items.Add(debugOomButton);
             foreach (ToolStripItem item in settingsMenu.Items)
             {
                 item.BackColor = palette.Surface;
@@ -213,20 +204,10 @@ namespace RAGSearch
             HandleCreated += (sender, args) => ApplyScaledMetrics();
             DpiChangedAfterParent += (sender, args) => ApplyScaledMetrics();
 
-            nativeImportRunner.ProgressChanged += NativeImportRunnerOnProgressChanged;
+            outlookMapiImportRunner.ProgressChanged += OutlookMapiImportRunnerOnProgressChanged;
             Load += async (sender, args) =>
             {
-                StartupTrace.Step("BEGIN SearchPaneControl.Load (loopback health only)");
-                try
-                {
-                    await RefreshHealthAsync();
-                    StartupTrace.Step("END SearchPaneControl.Load");
-                }
-                catch (Exception ex)
-                {
-                    StartupTrace.Failure("SearchPaneControl.Load", ex);
-                    throw;
-                }
+                await RefreshHealthAsync();
             };
         }
 
@@ -727,7 +708,7 @@ namespace RAGSearch
             var textColor = selected ? palette.SelectionText : palette.Text;
             var mutedColor = selected ? palette.SelectionMutedText : palette.MutedText;
             var bounds = Rectangle.Inflate(eventArgs.CellBounds, -ScaleLogical(7), 0);
-            var subject = CleanInline(result.subject);
+            var subject = CleanInline(result.Subject);
             var snippet = BuildVisibleSnippet(result);
             if (subject.Length == 0)
             {
@@ -816,11 +797,11 @@ namespace RAGSearch
 
         private async Task SearchAsync()
         {
-            if (probeRunning || resetRunning)
+            if (resetRunning)
             {
                 return;
             }
-            if (nativeImportRunner.IsRunning)
+            if (outlookMapiImportRunner.IsRunning)
             {
                 statusLabel.Text = "Дождитесь завершения индексации или остановите её через ⚙.";
                 return;
@@ -844,7 +825,6 @@ namespace RAGSearch
             searchCancellation = currentCancellation;
             queryBox.Enabled = false;
             searchButton.Enabled = false;
-            debugOomButton.Enabled = false;
             resultsGrid.Cursor = Cursors.WaitCursor;
             UpdateResetIndexButtonEnabled();
             emptyStateText = "Ищу письма...";
@@ -852,7 +832,7 @@ namespace RAGSearch
             statusLabel.Text = "Проверяю локальный сервис...";
             try
             {
-                await nativeImportRunner.EnsureServiceReadyAsync(currentCancellation.Token);
+                await outlookMapiImportRunner.EnsureServiceReadyAsync(currentCancellation.Token);
                 currentCancellation.Token.ThrowIfCancellationRequested();
                 statusLabel.Text = "Ищу по смыслу и точным совпадениям...";
                 var response = await serviceClient.SearchAsync(
@@ -860,20 +840,23 @@ namespace RAGSearch
                     SearchLimit,
                     currentCancellation.Token);
                 currentCancellation.Token.ThrowIfCancellationRequested();
-                if (probeRunning || currentGeneration != searchGeneration)
+                if (currentGeneration != searchGeneration)
                 {
                     throw new OperationCanceledException(currentCancellation.Token);
                 }
 
-                var results = response == null || response.results == null
-                    ? new List<SearchResultDto>()
-                    : response.results;
+                if (response == null || response.Results == null)
+                {
+                    throw new InvalidOperationException(
+                        "Локальный сервис вернул ответ без обязательного списка results.");
+                }
+                var results = response.Results;
                 PopulateResults(results);
                 statusLabel.Text = FormatSearchStatus(response, results.Count);
             }
             catch (OperationCanceledException)
             {
-                if (!probeRunning && currentGeneration == searchGeneration)
+                if (currentGeneration == searchGeneration)
                 {
                     statusLabel.Text = "Поиск отменён.";
                     if (resultsGrid.Rows.Count == 0)
@@ -885,7 +868,7 @@ namespace RAGSearch
             }
             catch (Exception ex)
             {
-                if (!probeRunning && currentGeneration == searchGeneration)
+                if (currentGeneration == searchGeneration)
                 {
                     statusLabel.Text = "Поиск не выполнен: " + ex.Message;
                     if (resultsGrid.Rows.Count == 0)
@@ -902,11 +885,8 @@ namespace RAGSearch
                     searchCancellation = null;
                     RunOnUi(() =>
                     {
-                        queryBox.Enabled = !probeRunning && !resetRunning;
-                        searchButton.Enabled = !probeRunning && !resetRunning;
-                        debugOomButton.Enabled = !probeRunning &&
-                                                       !resetRunning &&
-                                                       !nativeImportRunner.IsRunning;
+                        queryBox.Enabled = !resetRunning;
+                        searchButton.Enabled = !resetRunning;
                         resultsGrid.Cursor = Cursors.Default;
                         UpdateResetIndexButtonEnabled();
                     });
@@ -924,14 +904,14 @@ namespace RAGSearch
                 for (var index = 0; index < results.Count; index++)
                 {
                     var result = results[index];
-                    if (result == null)
+                    if (result == null || result.Rank <= 0)
                     {
-                        continue;
+                        throw new InvalidOperationException(
+                            "Локальный сервис вернул некорректную строку результата.");
                     }
 
-                    var rank = result.rank > 0 ? result.rank : index + 1;
                     var rowIndex = resultsGrid.Rows.Add(
-                        rank,
+                        result.Rank,
                         BuildSubjectAndSnippet(result),
                         BuildSender(result),
                         result.ReceivedDisplay,
@@ -961,7 +941,7 @@ namespace RAGSearch
 
         private static string BuildSubjectAndSnippet(SearchResultDto result)
         {
-            var subject = CleanInline(result.subject);
+            var subject = CleanInline(result.Subject);
             var snippet = BuildVisibleSnippet(result);
             if (subject.Length == 0)
             {
@@ -972,14 +952,14 @@ namespace RAGSearch
 
         private static string BuildSender(SearchResultDto result)
         {
-            var sender = CleanInline(result.sender_name);
-            return sender.Length == 0 ? CleanInline(result.sender_email) : sender;
+            var sender = CleanInline(result.SenderName);
+            return sender.Length == 0 ? CleanInline(result.SenderEmail) : sender;
         }
 
         private static string BuildVisibleSnippet(SearchResultDto result)
         {
-            var snippet = CleanInline(result.snippet);
-            if (snippet.Length == 0 || result.matched_sources == null)
+            var snippet = CleanInline(result.Snippet);
+            if (snippet.Length == 0 || result.MatchedSources == null)
             {
                 return snippet;
             }
@@ -987,7 +967,7 @@ namespace RAGSearch
             // A subject/sender/folder hit is represented by the service's metadata
             // chunk. Showing that raw chunk leaks implementation labels such as
             // "Conversation" into the result row and merely repeats the subject.
-            if (result.matched_sources.Contains("message_metadata") &&
+            if (result.MatchedSources.Contains("message_metadata") &&
                 snippet.StartsWith("Subject:", StringComparison.OrdinalIgnoreCase))
             {
                 return "совпадение в теме или реквизитах письма";
@@ -998,8 +978,8 @@ namespace RAGSearch
 
         private static string BuildFolder(SearchResultDto result)
         {
-            var store = CleanInline(result.store_name);
-            var folder = CleanInline(result.folder_path);
+            var store = CleanInline(result.StoreName);
+            var folder = CleanInline(result.FolderPath);
             if (store.Length == 0)
             {
                 return folder;
@@ -1015,7 +995,7 @@ namespace RAGSearch
         {
             return string.Format(
                 "{0}\r\n{1}\r\n{2}\r\nДвойной щелчок открывает исходное письмо Outlook.",
-                CleanInline(result.subject),
+                CleanInline(result.Subject),
                 BuildVisibleSnippet(result),
                 BuildFolder(result));
         }
@@ -1044,8 +1024,7 @@ namespace RAGSearch
         {
             if (resultCount == 0)
             {
-                if (response != null &&
-                    string.Equals(response.mode, "single-token-no-literal", StringComparison.Ordinal))
+                if (string.Equals(response.Mode, "single-token-no-literal", StringComparison.Ordinal))
                 {
                     return "Точных совпадений нет. Для поиска только по смыслу введите фразу из двух или более слов.";
                 }
@@ -1187,7 +1166,7 @@ namespace RAGSearch
                 statusLabel.Text = "Дождитесь завершения очистки локального индекса.";
                 return;
             }
-            if (nativeImportRunner.IsRunning)
+            if (outlookMapiImportRunner.IsRunning)
             {
                 statusLabel.Text = "Индексация уже выполняется.";
                 return;
@@ -1199,21 +1178,20 @@ namespace RAGSearch
             }
 
             indexButton.Enabled = false;
-            debugOomButton.Enabled = false;
             UpdateResetIndexButtonEnabled();
             stopButton.Enabled = true;
             statusLabel.Text = "Готовлю read-only Extended MAPI индексацию...";
             try
             {
-                await nativeImportRunner.RunAsync();
+                await outlookMapiImportRunner.RunAsync();
             }
             catch (OperationCanceledException)
             {
-                RunOnUi(() => statusLabel.Text = "Native-индексация остановлена пользователем.");
+                RunOnUi(() => statusLabel.Text = "Outlook MAPI-индексация остановлена пользователем.");
             }
             catch (Exception ex)
             {
-                var message = "Native-индексация не выполнена: " + ex.Message;
+                var message = "Outlook MAPI-индексация не выполнена: " + ex.Message;
                 RunOnUi(() => statusLabel.Text = message);
             }
             finally
@@ -1221,7 +1199,6 @@ namespace RAGSearch
                 RunOnUi(() =>
                 {
                     indexButton.Enabled = !resetRunning;
-                    debugOomButton.Enabled = !resetRunning && searchCancellation == null;
                     stopButton.Enabled = false;
                     UpdateResetIndexButtonEnabled();
                 });
@@ -1230,66 +1207,10 @@ namespace RAGSearch
 
         private void StopButtonOnClick(object sender, EventArgs eventArgs)
         {
-            if (nativeImportRunner.IsRunning)
+            if (outlookMapiImportRunner.IsRunning)
             {
-                nativeImportRunner.RequestStop();
+                outlookMapiImportRunner.RequestStop();
                 stopButton.Enabled = false;
-            }
-        }
-
-        private void DebugOomButtonOnClick(object sender, EventArgs eventArgs)
-        {
-            if (resetRunning)
-            {
-                statusLabel.Text = "Дождитесь завершения очистки локального индекса.";
-                return;
-            }
-            if (probeRunning || nativeImportRunner.IsRunning)
-            {
-                statusLabel.Text = "Сначала остановите текущую индексацию.";
-                return;
-            }
-            if (searchCancellation != null)
-            {
-                statusLabel.Text = "Дождитесь завершения поиска перед диагностикой Outlook Guard.";
-                return;
-            }
-
-            probeRunning = true;
-            queryBox.Enabled = false;
-            searchButton.Enabled = false;
-            clearButton.Enabled = false;
-            indexButton.Enabled = false;
-            debugOomButton.Enabled = false;
-            UpdateResetIndexButtonEnabled();
-            stopButton.Enabled = false;
-            try
-            {
-                // Keep this synchronous on the Outlook UI thread. The probe
-                // deliberately reads one protected property for diagnostics.
-                var result = oomGuardProbe.Run(message =>
-                {
-                    statusLabel.Text = message;
-                    statusLabel.Update();
-                });
-                statusLabel.Text = result;
-            }
-            catch (Exception ex)
-            {
-                statusLabel.Text =
-                    "Диагностика Outlook Guard завершилась внутренней ошибкой: " +
-                    ex.GetType().Name;
-            }
-            finally
-            {
-                probeRunning = false;
-                queryBox.Enabled = true;
-                searchButton.Enabled = true;
-                clearButton.Enabled = true;
-                indexButton.Enabled = true;
-                debugOomButton.Enabled = true;
-                stopButton.Enabled = false;
-                UpdateResetIndexButtonEnabled();
             }
         }
 
@@ -1299,7 +1220,7 @@ namespace RAGSearch
             {
                 return;
             }
-            if (nativeImportRunner.IsRunning)
+            if (outlookMapiImportRunner.IsRunning)
             {
                 statusLabel.Text = "Сначала остановите текущую индексацию.";
                 return;
@@ -1309,12 +1230,6 @@ namespace RAGSearch
                 statusLabel.Text = "Дождитесь завершения поиска.";
                 return;
             }
-            if (probeRunning)
-            {
-                statusLabel.Text = "Дождитесь завершения диагностики Outlook Guard.";
-                return;
-            }
-
             var confirmation = MessageBox.Show(
                 this,
                 "Удалить весь локальный поисковый индекс RAGSearch?\r\n\r\n" +
@@ -1332,7 +1247,7 @@ namespace RAGSearch
 
             // A modal dialog pumps messages. Recheck all activity immediately
             // before issuing the destructive local-service request.
-            if (nativeImportRunner.IsRunning || searchCancellation != null || probeRunning)
+            if (outlookMapiImportRunner.IsRunning || searchCancellation != null)
             {
                 statusLabel.Text = "Очистка отменена: другая операция уже выполняется.";
                 UpdateResetIndexButtonEnabled();
@@ -1347,23 +1262,26 @@ namespace RAGSearch
             clearButton.Enabled = false;
             indexButton.Enabled = false;
             stopButton.Enabled = false;
-            debugOomButton.Enabled = false;
             resetIndexButton.Enabled = false;
             statusLabel.Text = "Проверяю локальный сервис перед очисткой индекса...";
             var completionStatus = "Очистка локального индекса завершилась без результата.";
             try
             {
-                await nativeImportRunner.EnsureServiceReadyAsync(currentCancellation.Token);
+                await outlookMapiImportRunner.EnsureServiceReadyAsync(currentCancellation.Token);
                 currentCancellation.Token.ThrowIfCancellationRequested();
                 var response = await serviceClient.ResetIndexAsync(currentCancellation.Token);
                 currentCancellation.Token.ThrowIfCancellationRequested();
-                completionStatus = response == null
-                    ? "Локальный индекс очищен; сервис не вернул счётчики."
-                    : string.Format(
-                        "Локальный индекс очищен: сообщений {0}, вложений {1}, чанков {2}.",
-                        response.deleted_messages,
-                        response.deleted_attachments,
-                        response.deleted_chunks);
+                if (response == null)
+                {
+                    throw new InvalidOperationException(
+                        "Локальный сервис вернул ответ без обязательных счётчиков очистки.");
+                }
+
+                completionStatus = string.Format(
+                    "Локальный индекс очищен: сообщений {0}, вложений {1}, чанков {2}.",
+                    response.DeletedMessages,
+                    response.DeletedAttachments,
+                    response.DeletedChunks);
                 resultsGrid.Rows.Clear();
                 emptyStateText = "Индекс очищен. Выполните индексацию через ⚙.";
                 resultsGrid.Invalidate();
@@ -1389,13 +1307,10 @@ namespace RAGSearch
                     statusLabel.Text = completionStatus;
                     queryBox.Enabled = true;
                     clearButton.Enabled = true;
-                    searchButton.Enabled = searchCancellation == null && !probeRunning;
-                    var indexing = nativeImportRunner.IsRunning;
-                    indexButton.Enabled = !indexing && !probeRunning;
+                    searchButton.Enabled = searchCancellation == null;
+                    var indexing = outlookMapiImportRunner.IsRunning;
+                    indexButton.Enabled = !indexing;
                     stopButton.Enabled = indexing;
-                    debugOomButton.Enabled = !indexing &&
-                                                   !probeRunning &&
-                                                   searchCancellation == null;
                     UpdateResetIndexButtonEnabled();
                 });
             }
@@ -1421,14 +1336,13 @@ namespace RAGSearch
             }
         }
 
-        private void NativeImportRunnerOnProgressChanged(object sender, NativeImportProgress progress)
+        private void OutlookMapiImportRunnerOnProgressChanged(object sender, OutlookMapiImportProgress progress)
         {
             RunOnUi(() =>
             {
-                var active = nativeImportRunner.IsRunning;
+                var active = outlookMapiImportRunner.IsRunning;
                 stopButton.Enabled = progress.IsRunning && active;
                 indexButton.Enabled = !active && !resetRunning;
-                debugOomButton.Enabled = !active && !resetRunning;
                 UpdateResetIndexButtonEnabled();
                 statusLabel.Text = progress.Status;
             });
@@ -1437,9 +1351,8 @@ namespace RAGSearch
         private void UpdateResetIndexButtonEnabled()
         {
             resetIndexButton.Enabled = !resetRunning &&
-                                       !probeRunning &&
                                        searchCancellation == null &&
-                                       !nativeImportRunner.IsRunning;
+                                       !outlookMapiImportRunner.IsRunning;
         }
 
         private async Task RefreshHealthAsync()
@@ -1448,7 +1361,7 @@ namespace RAGSearch
             {
                 var health = await serviceClient.GetHealthAsync(CancellationToken.None);
                 statusLabel.Text = health != null &&
-                                   string.Equals(health.status, "ok", StringComparison.OrdinalIgnoreCase)
+                                   string.Equals(health.Status, "ok", StringComparison.Ordinal)
                     ? "Локальный сервис готов."
                     : "Локальный сервис ответил, но сообщил об ошибке.";
             }
@@ -1708,10 +1621,10 @@ namespace RAGSearch
         {
             if (disposing)
             {
-                nativeImportRunner.ProgressChanged -= NativeImportRunnerOnProgressChanged;
-                if (nativeImportRunner.IsRunning)
+                outlookMapiImportRunner.ProgressChanged -= OutlookMapiImportRunnerOnProgressChanged;
+                if (outlookMapiImportRunner.IsRunning)
                 {
-                    nativeImportRunner.RequestStop();
+                    outlookMapiImportRunner.RequestStop();
                 }
                 if (searchCancellation != null)
                 {

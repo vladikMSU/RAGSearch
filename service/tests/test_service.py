@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import tempfile
 import threading
 import unittest
@@ -9,15 +10,18 @@ import urllib.error
 import urllib.request
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from ragsearch_service.app import SearchService
 from ragsearch_service.config import Settings
+from ragsearch_service.errors import ValidationError
 from ragsearch_service.http_api import create_http_server
 
 
 class ControlledEmbedder:
     name = "controlled-test-v1"
     dimensions = 2
+    fingerprint = "sha256:" + "1" * 64
 
     @staticmethod
     def _unit(cosine: float) -> list[float]:
@@ -46,6 +50,7 @@ class ControlledEmbedder:
 class AdversarialShortQueryEmbedder:
     name = "adversarial-short-query-v1"
     dimensions = 2
+    fingerprint = "sha256:" + "2" * 64
 
     @staticmethod
     def _unit(cosine: float) -> list[float]:
@@ -64,6 +69,15 @@ class AdversarialShortQueryEmbedder:
             else:
                 vectors.append(self._unit(0.0))
         return vectors
+
+
+class SettingsTests(unittest.TestCase):
+    def test_default_path_requires_localappdata(self) -> None:
+        for environment in ({}, {"LOCALAPPDATA": ""}):
+            with self.subTest(environment=environment):
+                with patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(RuntimeError, "LOCALAPPDATA is required"):
+                        Settings.default()
 
 
 class SearchServiceTests(unittest.TestCase):
@@ -90,7 +104,7 @@ class SearchServiceTests(unittest.TestCase):
             "modified_at": "2026-08-11T09:01:00Z",
             "internet_message_id": "<entry-1@example.test>",
             "conversation_id": "conversation-1",
-            "body": "Релиз проекта перенесли на октябрь. LegacyUniqueTerm присутствует здесь.",
+            "body": "Релиз проекта перенесли на октябрь. OriginalUniqueTerm присутствует здесь.",
             "attachments": [],
         }
         payload.update(changes)
@@ -134,6 +148,13 @@ class SearchServiceTests(unittest.TestCase):
         self.assertEqual(1, stats["attachments"])
         self.assertGreaterEqual(stats["chunks"], 3)
         self.assertEqual({"extracted": 1}, stats["attachment_extraction"])
+        self.assertEqual(3, stats["schema_version"])
+        self.assertEqual("hashing-v1-256", stats["embedding_model"])
+        self.assertEqual(256, stats["embedding_dim"])
+        self.assertRegex(
+            stats["embedding_fingerprint"],
+            r"\Asha256:[0-9a-f]{64}\Z",
+        )
 
     def test_upsert_replaces_only_that_messages_children(self) -> None:
         self.assertEqual(
@@ -156,7 +177,7 @@ class SearchServiceTests(unittest.TestCase):
         self.assertEqual(0, stats["attachments"])
         with self.service.database.session() as connection:
             stale = connection.execute(
-                'SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH "LegacyUniqueTerm"'
+                'SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH "OriginalUniqueTerm"'
             ).fetchone()[0]
         self.assertEqual(0, stale)
 
@@ -176,6 +197,93 @@ class SearchServiceTests(unittest.TestCase):
         self.assertEqual(1, outcome["failed"])
         self.assertEqual(1, len(outcome["errors"]))
         self.assertEqual(1, outcome["errors"][0]["index"])
+
+    def test_noncanonical_recipients_and_timestamps_are_rejected(self) -> None:
+        outcome = self.service.ingest_messages(
+            {"messages": [self.message(to=["user@example.test"])]}
+        )
+
+        self.assertEqual(0, outcome["accepted"])
+        self.assertEqual(1, outcome["failed"])
+        self.assertIn("to must be a string or null", outcome["errors"][0]["error"])
+
+        outcome = self.service.ingest_messages(
+            {"messages": [self.message(received_at="2026-08-11T09:00:00")]}
+        )
+        self.assertEqual(0, outcome["accepted"])
+        self.assertEqual(1, outcome["failed"])
+        self.assertIn("UTC offset", outcome["errors"][0]["error"])
+
+        for value in ("", "2026-08-11 09:00:00Z", "not-a-timestamp"):
+            with self.subTest(timestamp=value):
+                outcome = self.service.ingest_messages(
+                    {"messages": [self.message(received_at=value)]}
+                )
+                self.assertEqual(0, outcome["accepted"])
+                self.assertEqual(1, outcome["failed"])
+                self.assertIn("UTC offset", outcome["errors"][0]["error"])
+
+    def test_timestamps_are_canonical_utc_and_filters_compare_instants(self) -> None:
+        messages = [
+            self.message(
+                entry_id="before",
+                internet_message_id="<before@example.test>",
+                received_at="2026-08-11T12:00:00+03:00",
+                body="TemporalBoundaryMarker before",
+            ),
+            self.message(
+                entry_id="boundary",
+                internet_message_id="<boundary@example.test>",
+                received_at="2026-08-11T05:00:00-05:00",
+                body="TemporalBoundaryMarker boundary",
+            ),
+            self.message(
+                entry_id="after",
+                internet_message_id="<after@example.test>",
+                received_at="2026-08-11T10:00:00.000001Z",
+                body="TemporalBoundaryMarker after",
+            ),
+        ]
+        self.assertEqual(
+            3,
+            self.service.ingest_messages({"messages": messages})["accepted"],
+        )
+
+        with self.service.database.session() as connection:
+            stored = {
+                row["entry_id"]: row["received_at"]
+                for row in connection.execute(
+                    "SELECT entry_id, received_at FROM messages"
+                )
+            }
+        self.assertEqual("2026-08-11T09:00:00.000000Z", stored["before"])
+        self.assertEqual("2026-08-11T10:00:00.000000Z", stored["boundary"])
+        self.assertEqual("2026-08-11T10:00:00.000001Z", stored["after"])
+
+        response = self.service.search(
+            {
+                "query": "TemporalBoundaryMarker",
+                "limit": 10,
+                "filters": {
+                    "received_from": "2026-08-11T12:00:00+02:00",
+                    "received_to": "2026-08-11T10:00:00Z",
+                },
+            }
+        )
+        self.assertEqual(
+            ["boundary"],
+            [result["entry_id"] for result in response["results"]],
+        )
+
+        for value in (None, "", "2026-08-11T10:00:00", "not-a-timestamp"):
+            with self.subTest(filter_timestamp=value):
+                with self.assertRaisesRegex(ValidationError, "UTC offset"):
+                    self.service.search(
+                        {
+                            "query": "TemporalBoundaryMarker",
+                            "filters": {"received_from": value},
+                        }
+                    )
 
     def test_attachment_outside_spool_is_rejected(self) -> None:
         outside = Path(self.temporary.name) / "outside.txt"
@@ -279,61 +387,46 @@ class SearchServiceTests(unittest.TestCase):
         self.assertAlmostEqual(0.4, response["cutoff_similarity"], places=6)
         self.assertAlmostEqual(0.6, response["cutoff_distance"], places=6)
 
-    def test_exact_fts_match_survives_embedding_model_change(self) -> None:
+    def test_existing_index_rejects_a_different_embedding_model(self) -> None:
         self.service.ingest_messages(
-            {"messages": [self.message(body="LegacyModelExactMarker")]}
+            {"messages": [self.message(body="SingleModelContractMarker")]}
         )
-        self.service.embedder = ControlledEmbedder()
+        with self.assertRaisesRegex(RuntimeError, "embedding contract"):
+            SearchService(self.settings, embedder=ControlledEmbedder())
+        self.assertEqual(1, self.service.stats()["messages"])
 
-        response = self.service.search(
-            {"query": "LegacyModelExactMarker", "limit": 25}
-        )
+    def test_existing_index_rejects_same_model_label_with_new_fingerprint(self) -> None:
+        class ChangedImplementation(ControlledEmbedder):
+            fingerprint = "sha256:" + "3" * 64
 
-        self.assertEqual(1, response["lexical_fallback_count"])
-        self.assertEqual("entry-1", response["results"][0]["entry_id"])
-        self.assertEqual(
-            "lexical_token",
-            response["results"][0]["ranking_basis"],
-        )
-
-    def test_lexical_fallback_is_not_displaced_by_weak_vector_pool(self) -> None:
-        settings = replace(
-            Settings.explicit(Path(self.temporary.name) / "mixed-model-pool"),
-            search_candidate_message_limit=2,
-        )
-        legacy_service = SearchService(settings)
-        legacy_service.ingest_messages(
-            {
-                "messages": [
-                    self.message(
-                        entry_id="legacy-exact",
-                        internet_message_id="<legacy-exact@example.test>",
-                        subject="controlled-query",
-                        body="controlled-query",
-                    )
-                ]
-            }
-        )
+        settings = Settings.explicit(Path(self.temporary.name) / "fingerprint-change")
         service = SearchService(settings, embedder=ControlledEmbedder())
         service.ingest_messages(
-            {
-                "messages": [
-                    self.message(
-                        entry_id=f"current-{label}",
-                        internet_message_id=f"<current-{label}@example.test>",
-                        subject=label,
-                        body=label,
-                    )
-                    for label in ("weak-vector", "very-weak-vector")
-                ]
-            }
+            {"messages": [self.message(body="FingerprintContractMarker")]}
         )
 
-        response = service.search({"query": "controlled-query", "limit": 2})
+        with self.assertRaisesRegex(RuntimeError, "embedding contract"):
+            SearchService(settings, embedder=ChangedImplementation())
+        self.assertEqual(1, service.stats()["messages"])
 
-        self.assertEqual(1, response["lexical_fallback_count"])
-        self.assertEqual(["legacy-exact"], [item["entry_id"] for item in response["results"]])
-        self.assertEqual(2, response["max_results"])
+    def test_clear_index_allows_an_explicit_embedding_model_change(self) -> None:
+        settings = Settings.explicit(Path(self.temporary.name) / "model-change")
+        initial_service = SearchService(settings)
+        initial_service.ingest_messages({"messages": [self.message()]})
+        initial_service.clear_index()
+
+        switched_service = SearchService(settings, embedder=ControlledEmbedder())
+        switched_service.ingest_messages(
+            {"messages": [self.message(body="controlled-query")]}
+        )
+
+        response = switched_service.search({"query": "controlled-query", "limit": 2})
+        self.assertEqual("entry-1", response["results"][0]["entry_id"])
+        self.assertEqual(
+            "controlled-test-v1",
+            switched_service.stats()["embedding_model"],
+        )
+        self.assertEqual(2, switched_service.stats()["embedding_dim"])
 
     def test_vector_candidate_pool_keeps_best_chunk_per_message(self) -> None:
         settings = replace(
@@ -457,12 +550,9 @@ class SearchServiceTests(unittest.TestCase):
         )
         self.assertEqual("lexical_prefix", response["results"][0]["ranking_basis"])
 
-    def test_schema_v2_rebuilds_trigram_index_for_existing_chunks(self) -> None:
-        settings = Settings.explicit(Path(self.temporary.name) / "trigram-migration")
+    def test_schema_v2_is_rejected_without_modifying_it(self) -> None:
+        settings = Settings.explicit(Path(self.temporary.name) / "schema-v2")
         service = SearchService(settings)
-        service.ingest_messages(
-            {"messages": [self.message(body="История про киберспорт")]}
-        )
         with service.database.session() as connection:
             for trigger in (
                 "chunks_trigram_ai",
@@ -471,32 +561,26 @@ class SearchServiceTests(unittest.TestCase):
             ):
                 connection.execute(f"DROP TRIGGER {trigger}")
             connection.execute("DROP TABLE chunks_trigram")
-            connection.execute("PRAGMA user_version = 1")
+            connection.execute("PRAGMA user_version = 2")
 
-        service.database.initialize()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Unsupported database schema version 2; expected 3",
+        ):
+            service.database.initialize()
 
         with service.database.session() as connection:
-            matches = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM chunks_trigram WHERE chunks_trigram MATCH ?",
-                    ('"спорт"',),
-                ).fetchone()[0]
-            )
             schema_version = int(
                 connection.execute("PRAGMA user_version").fetchone()[0]
             )
-        self.assertGreater(matches, 0)
-        self.assertEqual(2, schema_version)
-
-        service.clear_index()
-        with service.database.session() as connection:
             self.assertEqual(
                 0,
                 connection.execute(
-                    "SELECT COUNT(*) FROM chunks_trigram WHERE chunks_trigram MATCH ?",
-                    ('"спорт"',),
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'chunks_trigram'"
                 ).fetchone()[0],
             )
+        self.assertEqual(2, schema_version)
 
     def test_token_is_stable_for_explicit_test_path(self) -> None:
         original = self.service.token
@@ -532,8 +616,8 @@ class HTTPAPITests(unittest.TestCase):
             "subject": "HTTP semantic test",
             "sender_name": "Test",
             "sender_email": "test@example.test",
-            "to": [],
-            "cc": [],
+            "to": "",
+            "cc": "",
             "sent_at": None,
             "received_at": "2026-08-11T10:00:00Z",
             "modified_at": None,
@@ -606,6 +690,7 @@ class HTTPAPITests(unittest.TestCase):
         )
         self.assertEqual(5, payload["max_results"])
         self.assertEqual(1, payload["results"][0]["rank"])
+        self.assertNotIn("score", payload["results"][0])
         self.assertIn("vector_similarity", payload["results"][0])
         self.assertIn("vector_distance", payload["results"][0])
 
@@ -634,6 +719,7 @@ class HTTPAPITests(unittest.TestCase):
         )
         self.service.ingest_messages({"messages": [message]})
         before = self.service.stats()
+        self.assertIsNotNone(before["embedding_fingerprint"])
         original_token = self.service.token
 
         status, payload = self._request("DELETE", "/v1/index")
@@ -646,6 +732,9 @@ class HTTPAPITests(unittest.TestCase):
         self.assertEqual(0, after["messages"])
         self.assertEqual(0, after["attachments"])
         self.assertEqual(0, after["chunks"])
+        self.assertIsNone(after["embedding_model"])
+        self.assertIsNone(after["embedding_dim"])
+        self.assertIsNone(after["embedding_fingerprint"])
         with self.service.database.session() as connection:
             fts_matches = connection.execute(
                 "SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?",

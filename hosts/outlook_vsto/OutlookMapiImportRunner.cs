@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -16,9 +15,14 @@ namespace RAGSearch
     /// Owns one native Extended MAPI import run.  This class deliberately has no
     /// Outlook Object Model dependency: the VSTO pane is only a process/UI host.
     /// </summary>
-    internal sealed class NativeImportRunner : IDisposable
+    internal sealed class OutlookMapiImportRunner : IDisposable
     {
         private const string ProgressPrefix = "RAGSEARCH_PROGRESS ";
+#if DEBUG
+        private const string ReaderBuildConfiguration = "Debug";
+#else
+        private const string ReaderBuildConfiguration = "Release";
+#endif
         private static readonly TimeSpan HealthProbeTimeout = TimeSpan.FromSeconds(2);
         private static readonly TimeSpan ServiceStartupTimeout = TimeSpan.FromSeconds(90);
         private static readonly TimeSpan GracefulStopTimeout = TimeSpan.FromSeconds(5);
@@ -33,12 +37,12 @@ namespace RAGSearch
         private bool disposed;
         private bool isRunning;
 
-        public NativeImportRunner(LocalServiceClient serviceClient)
+        public OutlookMapiImportRunner(LocalServiceClient serviceClient)
         {
             this.serviceClient = serviceClient ?? throw new ArgumentNullException("serviceClient");
         }
 
-        public event EventHandler<NativeImportProgress> ProgressChanged;
+        public event EventHandler<OutlookMapiImportProgress> ProgressChanged;
 
         public bool IsRunning
         {
@@ -59,7 +63,7 @@ namespace RAGSearch
                 ThrowIfDisposed();
                 if (isRunning)
                 {
-                    throw new InvalidOperationException("Native MAPI indexing is already running.");
+                    throw new InvalidOperationException("Outlook MAPI indexing is already running.");
                 }
 
                 isRunning = true;
@@ -69,11 +73,11 @@ namespace RAGSearch
 
             try
             {
-                var tools = WorkspaceTools.Find();
+                var layout = WorkspaceLayout.Load();
                 Report("checking_service", 0, 0, "Проверяю локальный сервис...", true);
-                await EnsureServiceAsync(tools, cancellation.Token).ConfigureAwait(false);
+                await EnsureServiceAsync(layout, cancellation.Token).ConfigureAwait(false);
                 cancellation.Token.ThrowIfCancellationRequested();
-                await RunAdapterAsync(tools, cancellation.Token).ConfigureAwait(false);
+                await RunAdapterAsync(layout, cancellation.Token).ConfigureAwait(false);
             }
             finally
             {
@@ -99,7 +103,7 @@ namespace RAGSearch
                 if (isRunning)
                 {
                     throw new InvalidOperationException(
-                        "Нельзя отдельно запускать сервис во время native MAPI индексации.");
+                        "Нельзя отдельно запускать сервис во время Outlook MAPI-индексации.");
                 }
             }
 
@@ -108,8 +112,8 @@ namespace RAGSearch
                 return;
             }
 
-            var tools = WorkspaceTools.FindForService();
-            await EnsureServiceAsync(tools, cancellationToken).ConfigureAwait(false);
+            var layout = WorkspaceLayout.LoadForService();
+            await EnsureServiceAsync(layout, cancellationToken).ConfigureAwait(false);
         }
 
         public void RequestStop()
@@ -127,12 +131,12 @@ namespace RAGSearch
                 return;
             }
 
-            Report("stopping", 0, 0, "Останавливаю native-индексацию...", true);
+            Report("stopping", 0, 0, "Останавливаю Outlook MAPI-индексацию...", true);
             TryCreateCancellationSentinel(sentinel);
             cancellation.Cancel();
         }
 
-        private async Task EnsureServiceAsync(WorkspaceTools tools, CancellationToken cancellationToken)
+        private async Task EnsureServiceAsync(WorkspaceLayout layout, CancellationToken cancellationToken)
         {
             if (await IsServiceHealthyAsync(cancellationToken).ConfigureAwait(false))
             {
@@ -149,16 +153,19 @@ namespace RAGSearch
             if (existingOwnedProcess == null || HasExited(existingOwnedProcess))
             {
                 var arguments = new StringBuilder();
-                arguments.Append(QuoteArgument(tools.ServiceScript));
+                arguments.Append("-m ragsearch_service");
                 arguments.Append(" --port ").Append(serviceClient.ServiceUri.Port);
                 arguments.Append(" --delete-spool-after-ingest");
-                if (Directory.Exists(tools.EmbeddingModelDirectory))
+                if (Directory.Exists(layout.EmbeddingModelDirectory))
                 {
                     arguments.Append(" --embedding sentence-transformers --model ");
-                    arguments.Append(QuoteArgument(tools.EmbeddingModelDirectory));
+                    arguments.Append(QuoteArgument(layout.EmbeddingModelDirectory));
                 }
 
-                var startInfo = HiddenPython(tools.PythonExecutable, arguments.ToString(), tools.ServiceDirectory);
+                var startInfo = HiddenPython(
+                    layout.PythonExecutable,
+                    arguments.ToString(),
+                    layout.ServiceDirectory);
                 var serviceProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
                 serviceProcess.OutputDataReceived += IgnoreProcessOutput;
                 serviceProcess.ErrorDataReceived += IgnoreProcessOutput;
@@ -196,7 +203,7 @@ namespace RAGSearch
                 if (HasExited(existingOwnedProcess))
                 {
                     throw new InvalidOperationException(
-                        "Python-сервис завершился при запуске. Проверьте service\\run.py и локальную модель embeddings.");
+                        "Python-сервис завершился при запуске. Проверьте модуль ragsearch_service и локальную модель embeddings.");
                 }
                 await Task.Delay(500, cancellationToken).ConfigureAwait(false);
             }
@@ -213,7 +220,7 @@ namespace RAGSearch
                 try
                 {
                     var health = await serviceClient.GetHealthAsync(probe.Token).ConfigureAwait(false);
-                    return health != null && string.Equals(health.status, "ok", StringComparison.OrdinalIgnoreCase);
+                    return health != null && string.Equals(health.Status, "ok", StringComparison.Ordinal);
                 }
                 catch (OperationCanceledException)
                 {
@@ -227,27 +234,30 @@ namespace RAGSearch
             }
         }
 
-        private async Task RunAdapterAsync(WorkspaceTools tools, CancellationToken cancellationToken)
+        private async Task RunAdapterAsync(WorkspaceLayout layout, CancellationToken cancellationToken)
         {
             var sentinel = Path.Combine(
                 Path.GetTempPath(),
-                "ragsearch-native-cancel-" + Guid.NewGuid().ToString("N") + ".flag");
+                "ragsearch-outlook-mapi-cancel-" + Guid.NewGuid().ToString("N") + ".flag");
             lock (gate)
             {
                 cancelFilePath = sentinel;
             }
 
             var arguments = new StringBuilder();
-            arguments.Append(QuoteArgument(tools.AdapterScript));
-            arguments.Append(" --executable ").Append(QuoteArgument(tools.NativeExecutable));
+            arguments.Append(QuoteArgument(layout.AdapterScript));
+            arguments.Append(" --executable ").Append(QuoteArgument(layout.ReaderExecutable));
             arguments.Append(" --service-url ").Append(QuoteArgument(serviceClient.ServiceUri.GetLeftPart(UriPartial.Authority)));
-            // Production indexing must not inherit the adapter's bounded probe defaults.
+            // Production indexing must not inherit the adapter's bounded scan defaults.
             arguments.Append(" --full-scan --body-preview-chars 4000000");
             arguments.Append(" --cancel-file ").Append(QuoteArgument(sentinel));
 
             var process = new Process
             {
-                StartInfo = HiddenPython(tools.PythonExecutable, arguments.ToString(), tools.WorkspaceRoot),
+                StartInfo = HiddenPython(
+                    layout.PythonExecutable,
+                    arguments.ToString(),
+                    layout.WorkspaceRoot),
                 EnableRaisingEvents = true
             };
             var exit = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -274,7 +284,7 @@ namespace RAGSearch
             {
                 if (!process.Start())
                 {
-                    throw new InvalidOperationException("Windows did not start the native adapter.");
+                    throw new InvalidOperationException("Windows did not start the Outlook MAPI adapter.");
                 }
                 started = true;
                 job.Assign(process);
@@ -300,7 +310,7 @@ namespace RAGSearch
                         else
                         {
                             // Assignment happens immediately after Start, before the
-                            // adapter can normally create its probe child.  If Windows
+                            // adapter can normally create its reader child. If Windows
                             // rejects the Job, stop only this exact process.
                             process.Kill();
                         }
@@ -330,7 +340,7 @@ namespace RAGSearch
                     if (graceful != exit.Task)
                     {
                         // The Job contains only the adapter process started above and
-                        // its NativeMapiProbe child.  No pre-existing process is touched.
+                        // its OutlookMapiReader child.  No pre-existing process is touched.
                         job.Terminate();
                     }
                     await WaitForExitAfterTerminationAsync(process, exit.Task).ConfigureAwait(false);
@@ -347,7 +357,7 @@ namespace RAGSearch
             if (exitCode != 0)
             {
                 throw new InvalidOperationException(
-                    "Native MAPI adapter завершился с кодом " + exitCode +
+                    "Outlook MAPI adapter завершился с кодом " + exitCode +
                     ". Текст stderr скрыт, чтобы не выводить данные почты; запустите adapter из консоли для диагностики.");
             }
         }
@@ -395,31 +405,47 @@ namespace RAGSearch
                 return;
             }
 
-            if (value == null || value.current < 0 || value.total < 0 || value.bodies_truncated < 0)
+            if (value == null || value.Current < 0 || value.Total < 0 || value.BodiesTruncated < 0)
             {
                 return;
             }
 
             string status;
-            switch ((value.phase ?? string.Empty).ToLowerInvariant())
+            bool running;
+            switch (value.Phase ?? string.Empty)
             {
+                case "starting":
+                    status = "Запускаю OutlookMapiReader...";
+                    running = true;
+                    break;
                 case "importing":
-                    status = "Extended MAPI: проиндексировано " + value.current + " писем" +
-                             TruncatedSuffix(value.bodies_truncated);
+                    status = "Extended MAPI: проиндексировано " + value.Current + " писем" +
+                             TruncatedSuffix(value.BodiesTruncated);
+                    running = true;
                     break;
                 case "complete":
-                    status = "Native-индексация завершена: " + value.current + " писем" +
-                             TruncatedSuffix(value.bodies_truncated);
+                    status = "Outlook MAPI-индексация завершена: " + value.Current + " писем" +
+                             TruncatedSuffix(value.BodiesTruncated);
+                    running = false;
                     break;
                 case "cancelled":
-                    status = "Native-индексация остановлена: " + value.current + " писем" +
-                             TruncatedSuffix(value.bodies_truncated);
+                    status = "Outlook MAPI-индексация остановлена: " + value.Current + " писем" +
+                             TruncatedSuffix(value.BodiesTruncated);
+                    running = false;
+                    break;
+                case "failed":
+                    status = "Outlook MAPI-индексация завершилась с ошибкой.";
+                    running = false;
                     break;
                 default:
-                    status = "Extended MAPI: подготовка...";
-                    break;
+                    return;
             }
-            Report(value.phase, value.current, value.total, status, value.phase != "complete" && value.phase != "cancelled");
+            Report(
+                value.Phase,
+                value.Current,
+                value.Total,
+                status,
+                running);
         }
 
         private static string TruncatedSuffix(int bodiesTruncated)
@@ -434,7 +460,7 @@ namespace RAGSearch
             var handler = ProgressChanged;
             if (handler != null)
             {
-                handler(this, new NativeImportProgress
+                handler(this, new OutlookMapiImportProgress
                 {
                     Phase = phase,
                     Current = current,
@@ -555,11 +581,11 @@ namespace RAGSearch
             }
             catch (IOException)
             {
-                // Fallback job termination will still stop the owned process tree.
+                // Closing the owned Windows Job still stops the entire process tree.
             }
             catch (UnauthorizedAccessException)
             {
-                // Fallback job termination will still stop the owned process tree.
+                // Closing the owned Windows Job still stops the entire process tree.
             }
         }
 
@@ -628,146 +654,128 @@ namespace RAGSearch
         private sealed class AdapterProgress
         {
             [DataMember(Name = "phase")]
-            public string phase { get; set; }
+            public string Phase { get; set; }
             [DataMember(Name = "current")]
-            public int current { get; set; }
+            public int Current { get; set; }
             [DataMember(Name = "total")]
-            public int total { get; set; }
+            public int Total { get; set; }
             [DataMember(Name = "bodies_truncated")]
-            public int bodies_truncated { get; set; }
+            public int BodiesTruncated { get; set; }
         }
 
-        private sealed class WorkspaceTools
+        private sealed class WorkspaceLayout
         {
             public string WorkspaceRoot { get; private set; }
             public string ServiceDirectory { get; private set; }
             public string PythonExecutable { get; private set; }
-            public string ServiceScript { get; private set; }
             public string AdapterScript { get; private set; }
-            public string NativeExecutable { get; private set; }
+            public string ReaderExecutable { get; private set; }
             public string EmbeddingModelDirectory { get; private set; }
 
-            public static WorkspaceTools Find()
+            public static WorkspaceLayout Load()
             {
-                return Find(false);
+                return Load(false);
             }
 
-            public static WorkspaceTools FindForService()
+            public static WorkspaceLayout LoadForService()
             {
-                return Find(true);
+                return Load(true);
             }
 
-            private static WorkspaceTools Find(bool serviceOnly)
+            private static WorkspaceLayout Load(bool serviceOnly)
             {
-                var assemblyPath = typeof(NativeImportRunner).Assembly.Location;
-                var startingDirectories = new List<string>();
-                AddCandidate(startingDirectories, Environment.GetEnvironmentVariable("RAGSEARCH_WORKSPACE"));
-                AddCandidate(startingDirectories, Path.GetDirectoryName(assemblyPath));
-                AddCandidate(startingDirectories, ReadManifestDirectory());
-
-                foreach (var startingDirectory in startingDirectories)
+                var manifestDirectory = ReadManifestDirectory();
+                var workspaceDirectory = new DirectoryInfo(manifestDirectory);
+                for (var level = 0; level < 4; level++)
                 {
-                    var directory = new DirectoryInfo(startingDirectory);
-                    for (var depth = 0; directory != null && depth < 10; depth++, directory = directory.Parent)
+                    workspaceDirectory = workspaceDirectory.Parent;
+                    if (workspaceDirectory == null)
                     {
-                        var solution = Path.Combine(directory.FullName, "RAGSearch.sln");
-                        if (!File.Exists(solution))
-                        {
-                            continue;
-                        }
-
-                        var serviceDirectory = Path.Combine(directory.FullName, "service");
-                        var python = Path.Combine(serviceDirectory, ".venv", "Scripts", "python.exe");
-                        var service = Path.Combine(serviceDirectory, "run.py");
-                        var adapter = Path.Combine(serviceDirectory, "import_native_mapi.py");
-                        var native = Path.Combine(
-                            directory.FullName,
-                            "native-mapi-probe",
-                            "build-direct",
-                            "NativeMapiProbe.exe");
-                        var missing = serviceOnly
-                            ? MissingTool(python, service)
-                            : MissingTool(python, service, adapter, native);
-                        if (missing != null)
-                        {
-                            throw new FileNotFoundException(
-                                "RAGSearch workspace найден, но отсутствует " + missing +
-                                ". Соберите native worker и создайте service\\.venv.");
-                        }
-
-                        return new WorkspaceTools
-                        {
-                            WorkspaceRoot = directory.FullName,
-                            ServiceDirectory = serviceDirectory,
-                            PythonExecutable = python,
-                            ServiceScript = service,
-                            AdapterScript = adapter,
-                            NativeExecutable = native,
-                            EmbeddingModelDirectory = Path.Combine(
-                                serviceDirectory,
-                                "models",
-                                "paraphrase-multilingual-MiniLM-L12-v2")
-                        };
+                        throw new DirectoryNotFoundException(
+                            "Manifest RAGSearch не соответствует layout hosts\\outlook_vsto\\bin\\<Configuration>.");
                     }
                 }
 
-                throw new DirectoryNotFoundException(
-                    "Не найден workspace RAGSearch рядом с установленной надстройкой. " +
-                    "Ожидались RAGSearch.sln, service и native-mapi-probe выше " + assemblyPath + ".");
-            }
+                var workspace = workspaceDirectory.FullName;
+                var solution = Path.Combine(workspace, "RAGSearch.sln");
+                var serviceDirectory = Path.Combine(workspace, "service");
+                var python = Path.Combine(serviceDirectory, ".venv", "Scripts", "python.exe");
+                var serviceEntrypoint = Path.Combine(
+                    serviceDirectory,
+                    "ragsearch_service",
+                    "__main__.py");
+                var connectorDirectory = Path.Combine(
+                    workspace,
+                    "connectors",
+                    "outlook_mapi");
+                var adapter = Path.Combine(connectorDirectory, "adapter.py");
+                var reader = Path.Combine(
+                    connectorDirectory,
+                    "native",
+                    "bin",
+                    "x64",
+                    ReaderBuildConfiguration,
+                    "OutlookMapiReader.exe");
+                var missing = serviceOnly
+                    ? MissingTool(solution, python, serviceEntrypoint)
+                    : MissingTool(solution, python, serviceEntrypoint, adapter, reader);
+                if (missing != null)
+                {
+                    throw new FileNotFoundException(
+                        "RAGSearch layout неполон: отсутствует " + missing +
+                        ". Соберите solution и создайте service\\.venv.");
+                }
 
-            private static void AddCandidate(ICollection<string> candidates, string path)
-            {
-                if (string.IsNullOrWhiteSpace(path))
+                return new WorkspaceLayout
                 {
-                    return;
-                }
-                try
-                {
-                    var fullPath = Path.GetFullPath(path.Trim());
-                    if (Directory.Exists(fullPath) && !candidates.Contains(fullPath))
-                    {
-                        candidates.Add(fullPath);
-                    }
-                }
-                catch (Exception ex) when (ex is ArgumentException || ex is NotSupportedException || ex is PathTooLongException)
-                {
-                    // Ignore an invalid optional override/manifest and use the next source.
-                }
+                    WorkspaceRoot = workspace,
+                    ServiceDirectory = serviceDirectory,
+                    PythonExecutable = python,
+                    AdapterScript = adapter,
+                    ReaderExecutable = reader,
+                    EmbeddingModelDirectory = Path.Combine(
+                        serviceDirectory,
+                        "models",
+                        "paraphrase-multilingual-MiniLM-L12-v2")
+                };
             }
 
             private static string ReadManifestDirectory()
             {
-                try
+                using (var key = Registry.CurrentUser.OpenSubKey(
+                           @"Software\Microsoft\Office\Outlook\Addins\RAGSearch",
+                           false))
                 {
-                    using (var key = Registry.CurrentUser.OpenSubKey(
-                               @"Software\Microsoft\Office\Outlook\Addins\RAGSearch",
-                               false))
+                    if (key == null)
                     {
-                        var manifest = key == null ? null : key.GetValue("Manifest") as string;
-                        if (string.IsNullOrWhiteSpace(manifest))
-                        {
-                            return null;
-                        }
-                        var separator = manifest.IndexOf('|');
-                        if (separator >= 0)
-                        {
-                            manifest = manifest.Substring(0, separator);
-                        }
-                        Uri uri;
-                        var manifestPath = Uri.TryCreate(manifest, UriKind.Absolute, out uri) && uri.IsFile
-                            ? uri.LocalPath
-                            : manifest;
-                        return Path.GetDirectoryName(manifestPath);
+                        throw new InvalidOperationException(
+                            "RAGSearch не зарегистрирован в текущем профиле Outlook.");
                     }
-                }
-                catch (Exception ex) when (
-                    ex is IOException ||
-                    ex is UnauthorizedAccessException ||
-                    ex is System.Security.SecurityException ||
-                    ex is ArgumentException)
-                {
-                    return null;
+                    var manifest = key.GetValue("Manifest") as string;
+                    if (string.IsNullOrWhiteSpace(manifest))
+                    {
+                        throw new InvalidOperationException(
+                            "В регистрации RAGSearch отсутствует путь Manifest.");
+                    }
+                    var separator = manifest.IndexOf('|');
+                    if (separator >= 0)
+                    {
+                        manifest = manifest.Substring(0, separator);
+                    }
+                    Uri uri;
+                    if (!Uri.TryCreate(manifest, UriKind.Absolute, out uri) || !uri.IsFile)
+                    {
+                        throw new InvalidOperationException(
+                            "Manifest RAGSearch должен быть абсолютным file URI.");
+                    }
+                    var manifestPath = Path.GetFullPath(uri.LocalPath);
+                    var manifestDirectory = Path.GetDirectoryName(manifestPath);
+                    if (string.IsNullOrEmpty(manifestDirectory) || !Directory.Exists(manifestDirectory))
+                    {
+                        throw new DirectoryNotFoundException(
+                            "Каталог зарегистрированного Manifest RAGSearch не существует.");
+                    }
+                    return manifestDirectory;
                 }
             }
 
@@ -786,8 +794,8 @@ namespace RAGSearch
 
         /// <summary>
         /// A kill-on-close Windows Job containing only the adapter we start and its
-        /// descendants.  It is the bounded fallback when cooperative cancellation
-        /// cannot interrupt a native pipe read.
+        /// descendants.  Closing it is the enforced process boundary when cooperative
+        /// cancellation cannot interrupt a native pipe read.
         /// </summary>
         private sealed class OwnedProcessJob : IDisposable
         {
@@ -800,7 +808,7 @@ namespace RAGSearch
                 if (handle == IntPtr.Zero)
                 {
                     throw new InvalidOperationException(
-                        "Не удалось создать Windows Job для native adapter: " + Marshal.GetLastWin32Error());
+                        "Не удалось создать Windows Job для Outlook MAPI adapter: " + Marshal.GetLastWin32Error());
                 }
 
                 var information = new JobObjectExtendedLimitInformation();
@@ -830,7 +838,7 @@ namespace RAGSearch
                 if (!AssignProcessToJobObject(handle, process.Handle))
                 {
                     throw new InvalidOperationException(
-                        "Не удалось привязать native adapter к Windows Job: " + Marshal.GetLastWin32Error());
+                        "Не удалось привязать Outlook MAPI adapter к Windows Job: " + Marshal.GetLastWin32Error());
                 }
             }
 
@@ -908,7 +916,7 @@ namespace RAGSearch
         }
     }
 
-    internal sealed class NativeImportProgress : EventArgs
+    internal sealed class OutlookMapiImportProgress : EventArgs
     {
         public string Phase { get; set; }
         public int Current { get; set; }

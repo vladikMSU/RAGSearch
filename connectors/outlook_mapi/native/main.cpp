@@ -36,13 +36,9 @@
 
 namespace {
 
-#if defined(_MSC_VER) && _MSC_VER < 1914
-namespace fs = std::experimental::filesystem;
-#else
 namespace fs = std::filesystem;
-#endif
 
-static_assert(sizeof(void*) == 8, "NativeMapiProbe must be compiled as x64.");
+static_assert(sizeof(void*) == 8, "OutlookMapiReader must be compiled as x64.");
 
 constexpr std::size_t kQueryBatchSize = 64;
 constexpr std::size_t kMaximumCliLimit = 1'000'000;
@@ -183,7 +179,7 @@ bool IsEmailMessageClass(const std::wstring& messageClass) {
     // Custom mail forms and S/MIME variants are IPM.Note.<suffix>. Requiring
     // the dot prevents unrelated classes such as IPM.Notebook from matching.
     // REPORT.* and IPM.Schedule.Meeting.* intentionally do not match: Outlook
-    // materializes those as ReportItem/MeetingItem, while the previous OOM
+    // materializes those as ReportItem/MeetingItem, while the removed OOM
     // indexer accepted only `item as Outlook.MailItem`.
     return messageClass.size() == kMailClassLength ||
         messageClass[kMailClassLength] == L'.';
@@ -235,7 +231,6 @@ const SPropValue* FindProperty(
         return nullptr;
     }
 
-    const SPropValue* fallback = nullptr;
     for (ULONG index = 0; index < count; ++index) {
         const SPropValue& property = properties[index];
         if (PROP_ID(property.ulPropTag) != propertyId ||
@@ -245,9 +240,8 @@ const SPropValue* FindProperty(
         if (preferredType == PT_UNSPECIFIED || PROP_TYPE(property.ulPropTag) == preferredType) {
             return &property;
         }
-        fallback = &property;
     }
-    return fallback;
+    return nullptr;
 }
 
 std::wstring PropertyString(const SPropValue* property) {
@@ -957,8 +951,8 @@ void PrintMessage(
     ComPtr<IUnknown> object(rawObject);
     auto* message = reinterpret_cast<IMessage*>(rawObject);
 
-    SizedSPropTagArray(28, tags) = {
-        28,
+    SizedSPropTagArray(22, tags) = {
+        22,
         {
             PR_ENTRYID,
             PR_STORE_ENTRYID,
@@ -968,14 +962,10 @@ void PrintMessage(
             PR_SENDER_NAME_A,
             PR_SENDER_SMTP_ADDRESS_W,
             PR_SENDER_SMTP_ADDRESS_A,
-            PR_SENDER_EMAIL_ADDRESS_W,
-            PR_SENDER_EMAIL_ADDRESS_A,
             PR_SENT_REPRESENTING_NAME_W,
             PR_SENT_REPRESENTING_NAME_A,
             PR_SENT_REPRESENTING_SMTP_ADDRESS_W,
             PR_SENT_REPRESENTING_SMTP_ADDRESS_A,
-            PR_SENT_REPRESENTING_EMAIL_ADDRESS_W,
-            PR_SENT_REPRESENTING_EMAIL_ADDRESS_A,
             PR_DISPLAY_TO_W,
             PR_DISPLAY_TO_A,
             PR_DISPLAY_CC_W,
@@ -985,9 +975,7 @@ void PrintMessage(
             PR_LAST_MODIFICATION_TIME,
             PR_INTERNET_MESSAGE_ID_W,
             PR_INTERNET_MESSAGE_ID_A,
-            PR_CONVERSATION_ID,
-            PR_CONVERSATION_INDEX,
-            PR_SEARCH_KEY
+            PR_CONVERSATION_ID
         }
     };
     ULONG propertyCount = 0;
@@ -1043,18 +1031,6 @@ void PrintMessage(
             propertyCount,
             PROP_ID(PR_SENT_REPRESENTING_SMTP_ADDRESS));
     }
-    if (senderEmail.empty()) {
-        senderEmail = PropertyStringById(
-            rawProperties,
-            propertyCount,
-            PROP_ID(PR_SENDER_EMAIL_ADDRESS));
-    }
-    if (senderEmail.empty()) {
-        senderEmail = PropertyStringById(
-            rawProperties,
-            propertyCount,
-            PROP_ID(PR_SENT_REPRESENTING_EMAIL_ADDRESS));
-    }
     const std::wstring displayTo = PropertyStringById(
         rawProperties,
         propertyCount,
@@ -1079,22 +1055,10 @@ void PrintMessage(
         rawProperties,
         propertyCount,
         PROP_ID(PR_INTERNET_MESSAGE_ID));
-    std::wstring conversationId = BinaryPropertyHex(
+    const std::wstring conversationId = BinaryPropertyHex(
         rawProperties,
         propertyCount,
         PROP_ID(PR_CONVERSATION_ID));
-    if (conversationId.empty()) {
-        conversationId = BinaryPropertyHex(
-            rawProperties,
-            propertyCount,
-            PROP_ID(PR_CONVERSATION_INDEX));
-    }
-    if (conversationId.empty()) {
-        conversationId = BinaryPropertyHex(
-            rawProperties,
-            propertyCount,
-            PROP_ID(PR_SEARCH_KEY));
-    }
     const BodyPreview body = ReadBody(message, options.bodyPreviewChars);
     const std::vector<AttachmentInfo> attachments = ReadAttachments(
         message,
@@ -1447,19 +1411,23 @@ void EnumerateStore(
                << (isDefault ? L" [default]" : L"") << L'\n'
                << L"  StoreID: " << storeId << L'\n';
 
-    // Start at the IPM subtree so the default probe traverses user-visible mailbox
+    // Start at the IPM subtree so the default scan traverses user-visible mailbox
     // content instead of internal Finder/Common Views nodes under the store root.
     const std::vector<BYTE> ipmSubtreeEntryId = ReadBinaryProperty(
         store.get(),
         PR_IPM_SUBTREE_ENTRYID);
+    if (ipmSubtreeEntryId.empty()) {
+        ++counters.errors;
+        diagnostic << L"[error] IMsgStore is missing PR_IPM_SUBTREE_ENTRYID; "
+                   << L"skipping store instead of traversing its root.\n";
+        return;
+    }
 
     ULONG objectType = 0;
     LPUNKNOWN rawRoot = nullptr;
     const HRESULT rootStatus = store->OpenEntry(
         static_cast<ULONG>(ipmSubtreeEntryId.size()),
-        ipmSubtreeEntryId.empty()
-            ? nullptr
-            : reinterpret_cast<LPENTRYID>(const_cast<BYTE*>(ipmSubtreeEntryId.data())),
+        reinterpret_cast<LPENTRYID>(const_cast<BYTE*>(ipmSubtreeEntryId.data())),
         nullptr,
         0,
         &objectType,
@@ -1593,8 +1561,8 @@ std::uint64_t ParseByteLimit(const wchar_t* value, const wchar_t* optionName) {
 
 void PrintUsage(std::wostream& output) {
     output
-        << L"NativeMapiProbe (x64, read-only Extended MAPI)\n\n"
-        << L"Usage: NativeMapiProbe.exe [options]\n\n"
+        << L"OutlookMapiReader (x64, read-only Extended MAPI)\n\n"
+        << L"Usage: OutlookMapiReader.exe [options]\n\n"
         << L"  --max-stores N          Stores to open; 0 = unlimited (default: 0)\n"
         << L"  --max-folders N         Folders to open globally; 0 = unlimited (default: 100)\n"
         << L"  --max-messages N        Messages to open globally; 0 = unlimited (default: 20)\n"
