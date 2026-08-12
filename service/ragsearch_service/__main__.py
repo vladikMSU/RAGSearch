@@ -11,10 +11,9 @@ from .http_api import create_http_server
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local Outlook hybrid-search service")
+    parser = argparse.ArgumentParser(description="Local document hybrid-search service")
     parser.add_argument("--port", type=int, default=8765, help="Loopback TCP port (default: 8765)")
     parser.add_argument("--data-dir", type=Path, help="Override the local data directory")
-    parser.add_argument("--spool-dir", type=Path, help="Override the validated attachment spool")
     parser.add_argument("--token-path", type=Path, help="Override the token file path")
     parser.add_argument(
         "--embedding",
@@ -23,11 +22,6 @@ def _parser() -> argparse.ArgumentParser:
         help="Embedding provider (default: deterministic dependency-free hash)",
     )
     parser.add_argument("--model", help="Locally cached sentence-transformers model name/path")
-    parser.add_argument(
-        "--delete-spool-after-ingest",
-        action="store_true",
-        help="Delete validated spool files only after their message transaction commits",
-    )
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -47,18 +41,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.data_dir:
         settings = Settings.explicit(
             args.data_dir,
-            spool_dir=args.spool_dir,
             token_path=args.token_path,
             port=args.port,
-            delete_spool_after_ingest=args.delete_spool_after_ingest,
         )
     else:
         settings = Settings.default(port=args.port)
         settings = replace(
             settings,
-            spool_dir=args.spool_dir or settings.spool_dir,
             token_path=args.token_path or settings.token_path,
-            delete_spool_after_ingest=args.delete_spool_after_ingest,
         )
 
     service = SearchService(
@@ -81,4 +71,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

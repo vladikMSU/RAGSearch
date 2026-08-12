@@ -12,7 +12,8 @@ RAGSearch **не проецирует** результаты в штатный �
 - текущая папка, `Explorer.CurrentView` и центральный список писем не меняются;
 - один список RAG Search может одновременно содержать письма из OST и PST;
 - строки сохраняют порядок, в котором их вернул backend;
-- каждая строка несёт точную пару `StoreID + EntryID`, а не приблизительный AQS.
+- каждая строка несёт opaque locator с точной парой `StoreID + EntryID`, а не
+  приблизительный AQS; backend хранит locator, но не интерпретирует его.
 
 ## Поток запроса и отображения
 
@@ -26,8 +27,8 @@ RAGSearch **не проецирует** результаты в штатный �
 5. Таблица показывает rank, тему с фрагментом, отправителя, дату и путь
    `store · folder`. Пустой ответ очищает только таблицу RAG Search.
 
-Лимит UI и hard cap API одинаковы — 25 писем. Если backend вернул поле `rank`, оно
-показывается как есть; иначе номер строки вычисляется из позиции результата.
+Лимит UI и hard cap API одинаковы — 25 писем. Protocol 4 требует положительный
+`rank` у каждой строки; некорректный ответ отклоняется целиком.
 
 Панель использует отдельные светлую и тёмную WinForms-палитры. Начальная палитра
 выбирается при создании control по Windows `AppsUseLightTheme`; таблица, selection,
@@ -43,17 +44,20 @@ input, buttons и settings menu используют согласованные 
 
 ## Exact identity и открытие оригинала
 
-Search response возвращает для каждого письма сохранённые при индексации
-`entry_id` и `store_id`. Двойной щелчок по строке или клавиша `Enter` вызывает на
-Outlook UI/STA thread:
+Search response возвращает для каждого документа сохранённый при индексации
+`locator`. VSTO проверяет, что это locator connector-а `outlook_mapi`, извлекает
+`entry_id` и `store_id`, после чего двойной щелчок по строке или клавиша `Enter`
+вызывает на Outlook UI/STA thread:
 
 ```csharp
-session.GetItemFromID(result.EntryId, result.StoreId);
+session.GetItemFromID(result.LocatorEntryId, result.LocatorStoreId);
 ```
 
 Полученный `MailItem` открывается через `Display(false)` в настоящем окне Outlook.
 Так открывается именно выбранная backend-строка, даже если одинаковая тема есть в
-нескольких папках или stores. Реализация находится в
+нескольких папках или stores. Python service при этом остаётся source-neutral:
+поля Outlook существуют только внутри locator и интерпретируются host-ом.
+Реализация находится в
 [`ThisAddIn.OpenSearchResult`](../hosts/outlook_vsto/ThisAddIn.cs#L93).
 
 Точность относится к состоянию store на момент индексации. Если письмо после этого
@@ -110,8 +114,9 @@ embedding model:
 - если literal hit отсутствует, single-token semantic guess не показывается.
 
 Поэтому `киберспорт`, `кибер` и `спорт` находят индексированное `киберспорт`, даже
-если dense model ставит короткое нерелевантное слово выше. Service требует schema
-v3; более старую локальную БД нужно удалить и заново построить из PST/OST.
+если dense model ставит короткое нерелевантное слово выше. Service требует
+нейтральную document schema v4; более старую Outlook-shaped локальную БД нужно
+удалить и заново построить из PST/OST.
 
 ## Документация Microsoft для отвергнутого пути
 

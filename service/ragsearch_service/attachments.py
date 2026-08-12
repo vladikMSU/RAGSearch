@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import html.parser
-import os
 import zipfile
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from xml.etree import ElementTree
-
-from .errors import ValidationError
 
 
 _TEXT_EXTENSIONS = {
@@ -28,11 +26,10 @@ _TEXT_EXTENSIONS = {
 
 
 @dataclass(frozen=True)
-class ExtractedAttachment:
+class ExtractedPart:
     text: str
     status: str
     error: str | None
-    safe_path: Path | None
 
 
 class _HTMLTextExtractor(html.parser.HTMLParser):
@@ -51,22 +48,6 @@ class _HTMLTextExtractor(html.parser.HTMLParser):
         return " ".join(self.parts)
 
 
-def _safe_spool_path(raw_path: str, spool_dir: Path) -> Path:
-    try:
-        root = spool_dir.resolve(strict=True)
-        candidate = Path(raw_path).resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise ValidationError(f"Attachment temp_path does not exist: {raw_path}") from exc
-
-    try:
-        common = os.path.commonpath((os.path.normcase(str(root)), os.path.normcase(str(candidate))))
-    except ValueError as exc:
-        raise ValidationError("Attachment temp_path is outside the configured spool directory") from exc
-    if common != os.path.normcase(str(root)) or not candidate.is_file():
-        raise ValidationError("Attachment temp_path is outside the configured spool directory")
-    return candidate
-
-
 def _decode_bytes(payload: bytes) -> str:
     if payload.startswith((b"\xff\xfe", b"\xfe\xff")):
         return payload.decode("utf-16")
@@ -80,17 +61,17 @@ def _decode_bytes(payload: bytes) -> str:
     return payload.decode("utf-8", errors="replace")
 
 
-def _extract_docx(path: Path, limit_bytes: int) -> str:
-    with zipfile.ZipFile(path) as archive:
+def _extract_docx(payload: bytes, limit_bytes: int) -> str:
+    with zipfile.ZipFile(BytesIO(payload)) as archive:
         try:
             info = archive.getinfo("word/document.xml")
         except KeyError as exc:
             raise ValueError("DOCX has no word/document.xml") from exc
         if info.file_size > limit_bytes:
             raise OverflowError("DOCX document XML exceeds the extraction limit")
-        payload = archive.read(info)
+        document_xml = archive.read(info)
 
-    root = ElementTree.fromstring(payload)
+    root = ElementTree.fromstring(document_xml)
     parts: list[str] = []
     for element in root.iter():
         local_name = element.tag.rsplit("}", 1)[-1]
@@ -101,53 +82,58 @@ def _extract_docx(path: Path, limit_bytes: int) -> str:
     return " ".join(parts)
 
 
-def extract_attachment(
-    attachment: dict[str, object],
+def extract_part(
+    content: bytes | None,
     *,
-    spool_dir: Path,
+    name: str,
+    media_type: str,
     limit_bytes: int,
-) -> ExtractedAttachment:
-    raw_path = attachment.get("temp_path")
-    if raw_path in {None, ""}:
-        return ExtractedAttachment("", "not_provided", None, None)
-    if not isinstance(raw_path, str):
-        raise ValidationError("Attachment temp_path must be a string or null")
+    text_limit_chars: int,
+) -> ExtractedPart:
+    """Extract searchable text from inline part bytes.
 
-    safe_path = _safe_spool_path(raw_path, spool_dir)
-    declared_name = attachment.get("name")
-    declared_suffix = (
-        Path(declared_name).suffix.casefold() if isinstance(declared_name, str) else ""
-    )
-    suffix = declared_suffix or safe_path.suffix.casefold()
-    content_type = str(attachment.get("content_type") or "").casefold()
+    The HTTP boundary owns decoding base64.  This function deliberately accepts
+    bytes rather than filesystem paths, so the service has no connector spool or
+    shared-filesystem contract.
+    """
+
+    if content is None:
+        return ExtractedPart("", "not_provided", None)
+    if len(content) > limit_bytes:
+        return ExtractedPart(
+            "",
+            "too_large",
+            f"Part content exceeds extraction limit ({limit_bytes} bytes)",
+        )
+
+    suffix = Path(name).suffix.casefold()
+    folded_media_type = media_type.casefold()
     supported = (
         suffix in _TEXT_EXTENSIONS
         or suffix == ".docx"
-        or content_type.startswith("text/")
-        or content_type in {"application/json", "application/xml"}
+        or folded_media_type.startswith("text/")
+        or folded_media_type in {"application/json", "application/xml"}
     )
     if not supported:
-        return ExtractedAttachment("", "unsupported", None, safe_path)
+        return ExtractedPart("", "unsupported", None)
 
     try:
-        size = safe_path.stat().st_size
-        if size > limit_bytes:
-            return ExtractedAttachment(
-                "",
-                "too_large",
-                f"Attachment exceeds extraction limit ({limit_bytes} bytes)",
-                safe_path,
-            )
         if suffix == ".docx":
-            text = _extract_docx(safe_path, limit_bytes)
+            text = _extract_docx(content, limit_bytes)
         else:
-            text = _decode_bytes(safe_path.read_bytes())
-            if suffix in {".html", ".htm"} or content_type == "text/html":
+            text = _decode_bytes(content)
+            if suffix in {".html", ".htm"} or folded_media_type == "text/html":
                 parser = _HTMLTextExtractor()
                 parser.feed(text)
                 text = parser.text()
-        return ExtractedAttachment(text, "extracted", None, safe_path)
+        if len(text) > text_limit_chars:
+            return ExtractedPart(
+                text[:text_limit_chars],
+                "extracted_truncated",
+                f"Extracted text truncated at {text_limit_chars} characters",
+            )
+        return ExtractedPart(text, "extracted", None)
     except OverflowError as exc:
-        return ExtractedAttachment("", "too_large", str(exc), safe_path)
-    except (OSError, ValueError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
-        return ExtractedAttachment("", "error", str(exc), safe_path)
+        return ExtractedPart("", "too_large", str(exc))
+    except (ValueError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        return ExtractedPart("", "error", str(exc))

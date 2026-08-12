@@ -96,11 +96,10 @@ namespace RAGSearch
             {
                 throw new ArgumentNullException("result");
             }
-            if (string.IsNullOrWhiteSpace(result.EntryId) ||
-                string.IsNullOrWhiteSpace(result.StoreId))
+            if (!result.IsOutlookDocument)
             {
                 throw new InvalidOperationException(
-                    "В локальном индексе нет EntryID или StoreID этого письма.");
+                    "Локальный индекс не вернул Outlook locator этого письма.");
             }
 
             Outlook.NameSpace session = null;
@@ -110,7 +109,9 @@ namespace RAGSearch
                 // This callback runs directly from the WinForms double-click on
                 // Outlook's UI/STA thread. Do not move this COM work to Task.Run.
                 session = Application.Session;
-                outlookItem = session.GetItemFromID(result.EntryId, result.StoreId);
+                outlookItem = session.GetItemFromID(
+                    result.LocatorEntryId,
+                    result.LocatorStoreId);
                 var mailItem = outlookItem as Outlook.MailItem;
                 if (mailItem == null)
                 {

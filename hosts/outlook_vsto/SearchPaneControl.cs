@@ -959,7 +959,7 @@ namespace RAGSearch
         private static string BuildVisibleSnippet(SearchResultDto result)
         {
             var snippet = CleanInline(result.Snippet);
-            if (snippet.Length == 0 || result.MatchedSources == null)
+            if (snippet.Length == 0)
             {
                 return snippet;
             }
@@ -967,8 +967,7 @@ namespace RAGSearch
             // A subject/sender/folder hit is represented by the service's metadata
             // chunk. Showing that raw chunk leaks implementation labels such as
             // "Conversation" into the result row and merely repeats the subject.
-            if (result.MatchedSources.Contains("message_metadata") &&
-                snippet.StartsWith("Subject:", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(result.SnippetPart, "metadata", StringComparison.Ordinal))
             {
                 return "совпадение в теме или реквизитах письма";
             }
@@ -993,11 +992,15 @@ namespace RAGSearch
 
         private static string BuildResultToolTip(SearchResultDto result)
         {
+            var action = result.IsOutlookDocument
+                ? "Двойной щелчок открывает исходное письмо Outlook."
+                : "Открытие этого источника в Outlook не поддерживается.";
             return string.Format(
-                "{0}\r\n{1}\r\n{2}\r\nДвойной щелчок открывает исходное письмо Outlook.",
+                "{0}\r\n{1}\r\n{2}\r\n{3}",
                 CleanInline(result.Subject),
                 BuildVisibleSnippet(result),
-                BuildFolder(result));
+                BuildFolder(result),
+                action);
         }
 
         private static string CleanInline(string value)
@@ -1278,9 +1281,9 @@ namespace RAGSearch
                 }
 
                 completionStatus = string.Format(
-                    "Локальный индекс очищен: сообщений {0}, вложений {1}, чанков {2}.",
-                    response.DeletedMessages,
-                    response.DeletedAttachments,
+                    "Локальный индекс очищен: документов {0}, частей {1}, чанков {2}.",
+                    response.DeletedDocuments,
+                    response.DeletedParts,
                     response.DeletedChunks);
                 resultsGrid.Rows.Clear();
                 emptyStateText = "Индекс очищен. Выполните индексацию через ⚙.";
@@ -1360,10 +1363,20 @@ namespace RAGSearch
             try
             {
                 var health = await serviceClient.GetHealthAsync(CancellationToken.None);
-                statusLabel.Text = health != null &&
-                                   string.Equals(health.Status, "ok", StringComparison.Ordinal)
-                    ? "Локальный сервис готов."
-                    : "Локальный сервис ответил, но сообщил об ошибке.";
+                if (health != null &&
+                    string.Equals(health.Status, "ok", StringComparison.Ordinal) &&
+                    health.Protocol == 4)
+                {
+                    statusLabel.Text = "Локальный сервис готов.";
+                }
+                else if (health != null && health.Protocol != 4)
+                {
+                    statusLabel.Text = "Запущена несовместимая версия локального сервиса.";
+                }
+                else
+                {
+                    statusLabel.Text = "Локальный сервис ответил, но сообщил об ошибке.";
+                }
             }
             catch (Exception)
             {

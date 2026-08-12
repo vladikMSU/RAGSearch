@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlsplit
 
-from .app import SearchService
+from .app import PROTOCOL_VERSION, SearchService
 from .errors import ValidationError
 from .security import token_matches
 
@@ -82,7 +82,10 @@ def create_http_server(service: SearchService) -> LocalHTTPServer:
                     self._write_json(HTTPStatus.OK, service.health())
                 except Exception:
                     LOGGER.exception("Health check failed")
-                    self._write_json(HTTPStatus.SERVICE_UNAVAILABLE, {"status": "error"})
+                    self._write_json(
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                        {"status": "error", "protocol": PROTOCOL_VERSION},
+                    )
                 return
             if path == "/v1/stats":
                 if not self._require_authorized():
@@ -100,15 +103,15 @@ def create_http_server(service: SearchService) -> LocalHTTPServer:
 
         def do_POST(self) -> None:
             path = urlsplit(self.path).path
-            if path not in {"/v1/messages", "/v1/search"}:
+            if path not in {"/v1/documents", "/v1/search"}:
                 self._write_json(HTTPStatus.NOT_FOUND, {"error": "not_found"})
                 return
             if not self._require_authorized():
                 return
             try:
                 payload = self._read_json()
-                if path == "/v1/messages":
-                    response = service.ingest_messages(payload)
+                if path == "/v1/documents":
+                    response = service.ingest_document(payload)
                 else:
                     response = service.search(payload)
                 self._write_json(HTTPStatus.OK, response)

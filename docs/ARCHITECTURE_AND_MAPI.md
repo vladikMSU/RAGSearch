@@ -2,295 +2,241 @@
 
 ## Короткий вывод
 
-RAGSearch — не монолит, в котором Python напрямую управляет Outlook. Получение
-писем и поисковое ядро уже разделены отдельным процессом, JSONL и HTTP API.
+В production-потоке RAGSearch осталось три процесса:
 
-Физические границы компонентов теперь отражены деревом каталогов, но domain model
-пока остаётся Outlook-shaped:
+1. VSTO-host внутри classic Outlook управляет UI и всем жизненным циклом импорта.
+2. `OutlookMapiReader.exe` читает Outlook profile через Extended MAPI и выдаёт
+   source-specific JSONL.
+3. Python search service принимает нейтральные документы по HTTP, индексирует их и
+   выполняет поиск.
 
-- API и схема базы данных всё ещё используют Outlook-специфичные идентификаторы;
-- Outlook/MAPI reader и adapter изолированы в `connectors/outlook_mapi`;
-- экспериментальный Outlook Object Model ingestion и diagnostics удалены из
-  production tree;
-- необходимые Extended MAPI headers и лицензия зафиксированы в Git на точном
-  upstream commit.
+C++ не запускает Python, не знает URL или HTTP-контракт. Python не запускает C++,
+не импортирует Outlook/MAPI-код и не читает созданные native-процессом пути. Ранее
+стоявший между ними `adapter.py` удалён; его orchestration и единственное нужное
+преобразование данных выполняет уже существующий VSTO-host.
 
-Extended MAPI reader на C++ нужен как Outlook-specific connector. Его следует не
-выбрасывать, а изолировать от нейтрального поискового ядра.
-
-## Текущий поток данных
+## Фактический поток данных
 
 ```mermaid
 flowchart LR
-    UI["Нижняя VSTO WinForms-панель"] --> R["OutlookMapiImportRunner"]
-    R --> A["Python-адаптер adapter.py"]
-    A --> N["OutlookMapiReader.exe (C++)"]
-    N --> M["Extended MAPI / профиль classic Outlook"]
-    N -- "JSONL: одно письмо на строку" --> A
-    A -- "POST /v1/messages" --> S["Python search service"]
-    S --> DB["SQLite + FTS5 + embeddings"]
-    UI -- "POST /v1/search" --> S
-    S -- "до 25 строк в порядке backend" --> UI
-    UI -- "двойной щелчок: StoreID + EntryID" --> O["Исходное письмо Outlook"]
+    UI["VSTO: нижняя панель и orchestration"]
+    CXX["OutlookMapiReader.exe"]
+    MAPI["Extended MAPI / Outlook profile"]
+    PY["Python document search service"]
+    DB["SQLite + FTS5 + embeddings"]
+    OUTLOOK["Исходное письмо Outlook"]
+
+    UI -- "запуск и остановка" --> CXX
+    CXX --> MAPI
+    CXX -- "Outlook JSONL" --> UI
+    UI -- "POST /v1/documents" --> PY
+    UI -- "POST /v1/search" --> PY
+    PY --> DB
+    PY -- "result + opaque locator" --> UI
+    UI -- "StoreID + EntryID из locator" --> OUTLOOK
 ```
 
-1. Кнопка **«Индексировать»** вызывает не старый Outlook-индексатор, а
-   [`OutlookMapiImportRunner.RunAsync()`](../hosts/outlook_vsto/OutlookMapiImportRunner.cs#L58).
+Стрелки `C++ -> Python` нет. VSTO последовательно читает одну JSONL-запись,
+преобразует её в один нейтральный `Document`, дожидается HTTP-ответа сервиса и
+только затем читает следующую. Это даёт естественный backpressure и не накапливает
+mailbox в памяти.
 
-2. Runner проверяет Python-сервис и затем запускает
-   [`connectors/outlook_mapi/adapter.py`](../hosts/outlook_vsto/OutlookMapiImportRunner.cs#L237).
+| Компонент | Ответственность | Чего он не знает |
+|---|---|---|
+| VSTO host | UI, запуск reader/service, cancellation, JSONL mapping, HTTP, открытие результата | внутренняя схема SQLite и реализация MAPI |
+| C++ reader | read-only Extended MAPI, source-specific JSONL, bounded extraction вложений | Python, HTTP, token, search model |
+| Python service | neutral documents, parts, chunking, embeddings, SQLite, search | Outlook, MAPI, native EXE и filesystem paths producer-а |
 
-3. Python-адаптер запускает
-   [`OutlookMapiReader.exe --jsonl`](../connectors/outlook_mapi/adapter.py#L820). Сам
-   Python MAPI-функции при этом не вызывает.
+Внутренние Python-модули `app.py`, `database.py`, `chunking.py` и
+`attachments.py` — обычные части одного процесса, а не дополнительные узлы
+runtime-графа. Отдельные `core/`, `infrastructure/` или новый adapter-слой ради
+самой слоистости не создаются.
 
-4. C++-процесс инициализирует MAPI, входит в default Outlook profile,
-   перечисляет stores, папки и письма, после чего печатает JSONL:
+## Две честные границы
 
-   - [`MAPIInitialize`](../connectors/outlook_mapi/native/main.cpp#L122);
-   - [`MAPILogonEx`](../connectors/outlook_mapi/native/main.cpp#L1667);
-   - [перечисление stores](../connectors/outlook_mapi/native/main.cpp#L1458);
-   - [выдача JSONL](../connectors/outlook_mapi/native/main.cpp#L1070).
+### C++ reader -> VSTO
 
-5. Python-адаптер валидирует JSON, контролирует пути временных файлов вложений и
-   отправляет каждое письмо обычным HTTP POST в `/v1/messages`:
-   [`post_message`](../connectors/outlook_mapi/adapter.py#L668).
+Reader остаётся Outlook-specific connector. В его JSONL закономерно присутствуют
+`store_id`, `entry_id`, `folder_entry_id`, MAPI metadata и сведения о вложениях.
+Это локальный pipe-контракт между connector и его host, а не domain model поискового
+сервиса.
 
-6. Поисковый Python-сервис валидирует DTO, разбивает metadata, body и attachments
-   на чанки, считает embeddings и записывает данные в SQLite:
-   [`SearchService._ingest_one`](../service/ragsearch_service/app.py#L175).
+Native-процесс получает от VSTO отдельный каталог одного запуска. Для
+`ATTACH_BY_VALUE` он может создать там bounded temporary file и указать его в
+JSONL. Reader не выбирает общий application directory и не передаёт путь Python.
 
-7. При поиске VSTO отправляет запрос в `/v1/search` с текстом запроса и лимитом
-   25: [`SearchPaneControl.SearchAsync`](../hosts/outlook_vsto/SearchPaneControl.cs#L798).
-   Результаты последовательно добавляются в собственный нижний WinForms
-   `DataGridView`, без повторной сортировки, поэтому сохраняют порядок backend:
-   [`PopulateResults`](../hosts/outlook_vsto/SearchPaneControl.cs#L898). Штатные Search bar,
-   текущая папка и список Outlook не изменяются.
+### VSTO -> Python service
 
-8. Двойной щелчок по строке (или `Enter`) передаёт точные `entry_id` и `store_id`
-   из результата в `NameSpace.GetItemFromID`, после чего исходный `MailItem`
-   открывается отдельным окном Outlook:
-   [`OpenSearchResult`](../hosts/outlook_vsto/ThisAddIn.cs#L93). Этот небольшой UI/navigation
-   слой закономерно остаётся Outlook-зависимым.
+Публичная ingestion-граница — только `POST /v1/documents`. В запросе находится
+один полный snapshot документа:
 
-## Что такое MAPI
+```json
+{
+  "source_key": "outlook_mapi:<64-hex-sha256>",
+  "kind": "email",
+  "title": "План запуска продукта",
+  "metadata": {
+    "sender_name": "Алексей",
+    "sender_email": "alex@example.test",
+    "to": "user@example.test",
+    "cc": "",
+    "received_at": "2026-08-11T09:00:00Z",
+    "folder_path": "Mailbox/Inbox",
+    "store_name": "Mailbox",
+    "internet_message_id": "<id@example.test>"
+  },
+  "locator": {
+    "connector": "outlook_mapi",
+    "store_id": "...",
+    "entry_id": "...",
+    "folder_entry_id": "..."
+  },
+  "parts": [
+    {
+      "key": "body",
+      "kind": "body",
+      "media_type": "text/plain",
+      "text": "Текст письма",
+      "truncated": false
+    },
+    {
+      "key": "attachment:0",
+      "kind": "attachment",
+      "name": "notes.txt",
+      "media_type": "text/plain",
+      "size": 123,
+      "content_base64": "..."
+    }
+  ]
+}
+```
 
-В проекте используется **Extended Messaging Application Programming Interface** —
-низкоуровневый локальный API Outlook/Exchange. Это не REST API, не
-MAPI-over-HTTP и не Python-пакет.
+- `source_key` — единственная identity для idempotent upsert. Outlook producer
+  детерминированно строит её из пары StoreID/EntryID.
+- `kind`, `title`, `metadata` и `parts` — нейтральные данные для поиска.
+- `locator` — bounded JSON, который service хранит и возвращает без интерпретации.
+  Только Outlook host знает, что внутри него означают StoreID и EntryID.
+  Зарезервированный ключ `__type` запрещён на wire boundary из-за специальной
+  семантики legacy .NET JSON serializer; остальные ключи остаются opaque.
+- `internet_message_id` остаётся metadata: поле бывает пустым, меняется между
+  системами и не подходит для локальной identity.
 
-Extended MAPI предоставляет доступ к:
+Старого `/v1/messages` и compatibility mapping нет. Ошибочный документ получает
+обычный non-2xx HTTP-ответ; успешный полный snapshot заменяет части только своего
+`source_key`.
 
-- настроенному Outlook profile;
-- message stores;
-- PST и текущему Exchange/OST store через установленные providers;
-- папкам, письмам, свойствам и вложениям.
+`GET /health` возвращает номер protocol contract. VSTO принимает только protocol
+`4` и явно просит завершить старый процесс service при несовпадении, поэтому
+остаточный процесс от schema/API v3 не маскируется под совместимый backend.
 
-Код не парсит `.pst` или `.ost` как файлы. Он обращается к store provider через
-MAPI. Поэтому открытый и заблокированный процессом Outlook файл OST не нужно
-копировать или читать напрямую.
+## Жизненный цикл вложения без общего spool
 
-## Откуда взялось MAPI
+1. VSTO создаёт приватный каталог конкретного запуска в своём локальном runtime
+   каталоге `%LOCALAPPDATA%\\RAGSearch\\reader-runs`.
+2. VSTO передаёт его reader-у через `--attachment-dir`.
+3. Reader сохраняет только bounded `ATTACH_BY_VALUE` streams и пишет путь в свой
+   JSONL. Embedded/OLE/by-reference attachments остаются metadata-only.
+4. VSTO канонизирует путь и принимает только обычный файл строго внутри созданного
+   им каталога.
+5. VSTO кодирует содержимое в `content_base64` нейтрального part и отправляет один
+   HTTP request.
+6. Service декодирует bytes, извлекает поддерживаемый текст и не сохраняет producer
+   path.
+7. После синхронного ответа VSTO удаляет файлы и в конце — собственный каталог.
 
-Под названием MAPI здесь скрываются три разных компонента.
+Таким образом, путь не пересекает HTTP boundary, а у временного файла ровно один
+владелец. В Python service больше нет `spool_dir`, `--spool-dir` или
+`--delete-spool-after-ingest`.
+
+Inline base64 выбран осознанно для небольшого локального проекта: он оставляет
+обычный JSON/HTTP-контракт и не добавляет multipart parser или upload service.
+Размер одного native attachment, суммарный inline content одного документа и общий
+HTTP request ограничены; вложения сверх бюджета остаются индексируемыми по имени и
+metadata без content. Production host передаёт не более 8 MiB binary content на
+документ; reader применяет тот же per-message бюджет до записи файлов, а service
+повторно проверяет decoded размер. Перед отправкой VSTO измеряет уже полностью
+сериализованный UTF-8 JSON и применяет тот же 48 MiB HTTP cap, что и service.
+
+## Нейтральная модель хранения
+
+Локальная schema хранит:
+
+- `documents` с уникальным `source_key`, `kind`, `title`, сериализованными
+  `metadata` и `locator`;
+- `parts` с producer-defined `part_key`, kind/name/media type и статусом извлечения;
+- `chunks`, привязанные к document и part.
+
+Search core агрегирует результаты по document identity и возвращает `source_key`,
+`kind`, `title`, `metadata`, opaque `locator`, snippet и matched parts. В tie-break,
+SQL identity и API больше не участвуют Outlook IDs.
+
+Outlook-host ограничивает producer title 65 536 символами. Search response читается
+потоково со строгим UTF-8 и hard cap 128 MiB; тот же предел установлен у JSON parser.
+Это оставляет bounded envelope даже при 25 результатах с opaque metadata/locator и
+не добавляет отдельный response-adapter.
+
+Переход намеренно является clean schema break: старую локальную БД нужно очистить
+и заново построить. Это индекс, воспроизводимый из Outlook, поэтому поддерживать
+две domain model или сложную миграцию хуже явной переиндексации.
+
+## Открытие исходного письма
+
+Поиск возвращает locator без попытки понять его на backend. VSTO проверяет
+`connector == "outlook_mapi"`, извлекает `store_id` и `entry_id` и на Outlook
+UI/STA thread вызывает:
+
+```csharp
+session.GetItemFromID(result.LocatorEntryId, result.LocatorStoreId);
+```
+
+Этот маленький navigation layer закономерно остаётся Outlook-specific. Если письмо
+после индексации перемещено, удалено или его PST отключён, сохранённый locator может
+перестать разрешаться; требуется переиндексация.
+
+## Что такое Extended MAPI
+
+Extended Messaging Application Programming Interface — низкоуровневый локальный
+API Outlook/Exchange. Это не REST API, не MAPI-over-HTTP и не Python-пакет.
+
+Reader обращается к настроенному Outlook profile и его store providers. Он не
+парсит `.pst` или `.ost` как файлы, поэтому открытый и заблокированный Outlook OST
+не нужно копировать или читать напрямую.
+
+C++ выбран по технической границе: Microsoft поддерживает Extended MAPI из
+unmanaged C/C++, тогда как прямой managed interop не является поддержанным путём.
+Отдельный EXE также не загружает native MAPI objects в Outlook/VSTO process и
+ограничивает последствия сбоя reader-а.
+
+Reader использует MAPI read-only: не запрашивает write flags и не отправляет, не
+создаёт, не сохраняет и не удаляет Outlook items. Временная запись на диск
+ограничена явно переданным каталогом вложений одного запуска.
+
+## Откуда берётся MAPI
 
 | Компонент | Источник |
 |---|---|
-| Шесть Extended MAPI headers для компиляции | Зафиксированы в `third_party/MAPIStubLibrary` из официального [Microsoft MAPIStubLibrary](https://github.com/microsoft/MAPIStubLibrary) |
-| `MAPI32.lib` для линковки | Имеющийся Windows/Visual Studio toolchain |
-| Рабочая реализация MAPI во время выполнения | Системный `mapi32.dll` перенаправляет вызовы в MAPI-подсистему установленного classic Outlook |
+| Extended MAPI headers | Зафиксированный набор из официального Microsoft MAPIStubLibrary |
+| `MAPI32.lib` | Windows/Visual Studio toolchain |
+| Runtime implementation | `mapi32.dll` и MAPI subsystem установленного classic Outlook |
 
-12 августа 2026 года dependency был повторно получен из upstream и закреплён на
-commit `a9505d73351554078431fc950a0bc34ada6fe39b`. В Git внесены минимальный
-транзитивный набор из шести headers, upstream MIT-лицензия и provenance с
-процедурой обновления: [`third_party/MAPIStubLibrary`](../third_party/MAPIStubLibrary/README.md).
+Headers закреплены в [`third_party/MAPIStubLibrary`](../third_party/MAPIStubLibrary)
+на upstream commit `a9505d73351554078431fc950a0bc34ada6fe39b`. В Git находятся
+необходимые headers, upstream MIT license и provenance; готовый EXE в Git не
+хранится.
 
-Таким образом:
-
-- рабочую MAPI-подсистему и provider даёт установленный classic Outlook;
-- системный dispatcher/stub присутствует в Windows;
-- developer headers с обычным Office на этой машине не установились и были
-  скачаны отдельно.
-
-Microsoft также описывает headers как отдельную загрузку из MAPIStubLibrary:
-[Install MAPI header files](https://learn.microsoft.com/en-us/office/client-developer/outlook/mapi/how-to-install-mapi-header-files).
-
-### Состояние воспроизводимости
-
-Исходные зависимости native reader находятся в Git. Готовый EXE по-прежнему
-сознательно не хранится. Единственный поддерживаемый build system — MSBuild;
-Debug и Release outputs разделены:
+Единственный поддерживаемый build system — MSBuild. Solution собирает VSTO host и
+native x64 reader, а Debug/Release outputs разделены:
 `connectors/outlook_mapi/native/bin/x64/<Configuration>/OutlookMapiReader.exe`.
-Их ожидает
-[`OutlookMapiImportRunner.cs`](../hosts/outlook_vsto/OutlookMapiImportRunner.cs#L712).
 
-На текущей машине установлен штатный Visual Studio workload
-`Desktop development with C++`. Канонический полный `Debug|x64` Rebuild решения и
-отдельный `Release|x64` Rebuild native reader через MSVC v143 прошли без warnings и
-errors. Для чистого clone требуется тот же workload; скачивать MAPI headers отдельно
-не нужно.
+## Удалённые контуры
 
-## Зачем нужен C++
+- Экспериментальный Outlook Object Model ingestion и diagnostics удалены из
+  production tree.
+- Python `adapter.py`, его progress protocol и adapter-specific tests удалены.
+- `/v1/messages`, Outlook-shaped database identity и public Outlook filters удалены.
+- Общий filesystem spool и двойное удаление файлов reader/adapter/service удалены.
 
-Основная причина техническая: Extended MAPI является unmanaged API. Microsoft
-поддерживает его прямое использование из C/C++. Использование MAPI из managed
-C#/VB через обычный .NET interop не поддерживается, а напрямую из скриптов MAPI
-не является scriptable API.
-
-Кроме того, битность MAPI-процесса должна совпадать с Outlook. В текущей системе
-и Outlook, и reader — x64.
-
-Это описано в документации Microsoft:
-[Selecting an API or technology for developing solutions for Outlook](https://learn.microsoft.com/en-us/office/client-developer/outlook/selecting-an-api-or-technology-for-developing-solutions-for-outlook).
-
-Отдельный EXE даёт и дополнительные преимущества:
-
-- native MAPI objects не загружаются внутрь процесса Outlook/VSTO;
-- сбой reader меньше рискует уронить Outlook;
-- сообщения можно стримить по одному, не накапливая mailbox в памяти;
-- процесс можно независимо остановить;
-- граница с остальной системой остаётся обычным JSONL.
-
-Следовательно, C++ оправдан как реализация Outlook/MAPI connector. Production
-компонент теперь называется `OutlookMapiReader` и лежит рядом со своим adapter.
-Открытым packaging-вопросом остаётся installer/release-поставка; native проект
-включён в `RAGSearch.sln` и собирается общей конфигурацией через
-`scripts/build.ps1`.
-
-## Почему был выбран Extended MAPI
-
-Защищённые свойства Outlook Object Model могут вызывать Object Model Guard.
-Microsoft перечисляет такие свойства отдельно в
-[Protected Properties and Methods](https://learn.microsoft.com/en-us/office/vba/outlook/how-to/security/protected-properties-and-methods).
-
-Задача прототипа состояла в чтении локального PST и текущего Exchange/OST store
-при сохранении strict security policy. Поэтому production ingestion читает store
-provider через Extended MAPI, а не вызывает защищённые getters вроде
-`MailItem.SenderEmailAddress`.
-
-Native reader не запрашивает write-флаги и не содержит операций отправки,
-сохранения, создания или удаления Outlook items. Запись на диск ограничена
-временным spool вложений.
-
-## Где действительно присутствуют Outlook и MAPI в Python
-
-### Production search core
-
-В `service/ragsearch_service` нет `win32com`, `Outlook.Application` или прямых
-MAPI-вызовов. Runtime по умолчанию использует только standard library:
-[`requirements.txt`](../service/requirements.txt#L1).
-
-### `connectors/outlook_mapi/adapter.py`
-
-Это не поисковое ядро, а Outlook/MAPI connector adapter. Он:
-
-- запускает native reader;
-- проверяет его JSONL contract;
-- контролирует spool;
-- преобразует native record в DTO сервиса;
-- отправляет DTO через HTTP.
-
-Адаптер обязан понимать такие поля, как `store_id`, `body_truncated` и временные
-пути вложений. Теперь эта source-specific обязанность явно локализована в каталоге
-connector, а не выглядит частью search core.
-
-## Удалённый экспериментальный Outlook Object Model code
-
-12 августа 2026 года из production-проекта удалены недостижимые
-`OutlookIndexer`, `OutlookItemExtractor`, их DTO, C# ingestion client method,
-Python `win32com` probe, OOM diagnostic UI и startup trace. Production VSTO host
-не содержит protected Outlook Object Model getters для ingestion или diagnostics.
-
-## Насколько система независима от источника
-
-Транспортная граница уже существует: любой producer технически может отправить
-JSON в `/v1/messages`.
-
-Но domain contract остаётся Outlook-specific. Сейчас обязательны:
-
-- `entry_id`;
-- `store_id`;
-- `folder_entry_id`.
-
-Они требуются в
-[`SearchService._normalize_message`](../service/ragsearch_service/app.py#L86), а
-база закрепляет identity как `UNIQUE(store_id, entry_id)`:
-[`database.py`](../service/ragsearch_service/database.py#L93).
-
-Поэтому новый Graph, IMAP, EML или filesystem producer должен притворяться
-Outlook и изобретать эти значения. Это означает, что implementation уже отделена
-от источника, но domain model ещё не отделена.
-
-## Почему недостаточно принимать только строку текста
-
-Для устойчивой индексации кроме текста необходимы:
-
-- стабильный source key для повторного upsert, reconciliation и удаления;
-- provenance, показывающий происхождение документа;
-- locator, позволяющий открыть оригинал;
-- title, авторы, даты и фильтруемые metadata;
-- границы body, attachments и других частей документа.
-
-Но эти данные не обязаны называться в терминах Outlook. Нейтральный contract может
-выглядеть так:
-
-```text
-source_key = connector + namespace + item_id
-kind       = email | file | note | ...
-title
-parts[]    = body / attachment / metadata
-metadata
-locator    = непрозрачный объект конкретного connector
-```
-
-Search core использует `source_key` для upsert и возвращает `locator`, не пытаясь
-интерпретировать его. Outlook connector хранит внутри locator `store_id`,
-`entry_id` и `folder_entry_id`; другой connector использует собственные данные.
-
-## Целевая граница (source-specific часть реализована)
-
-```text
-connectors/
-  outlook_mapi/
-    native/            # C++ Extended MAPI reader
-    adapter.py         # MAPI JSONL -> текущий HTTP ingestion contract
-
-core/                   # следующий логический этап
-  domain.py            # Document / Part / SourceKey / opaque Locator
-  ingest.py            # normalization, chunking, embeddings
-  search.py
-
-infrastructure/         # следующий логический этап
-  sqlite_repository.py
-  attachment_store.py
-
-hosts/
-  outlook_vsto/        # собственный Outlook UI и открытие оригиналов по locator
-```
-
-Состояние минимального практического порядка исправления:
-
-1. **Выполнено:** экспериментальный OOM diagnostic contour удалён из production
-   tree вместе с launcher, UI и startup trace.
-2. **Выполнено:** C++ reader и Python adapter собраны в едином
-   `connectors/outlook_mapi`, production-имя `probe` устранено.
-   VSTO UI/host также перенесён в `hosts/outlook_vsto` без изменения assembly и
-   deployment identity.
-3. **Следующий логический этап:** заменить `/v1/messages` нейтральным
-   `/v1/documents` с `source_key`, `parts`, `metadata` и opaque `locator` одним
-   изменением всех producer/consumer, без compatibility endpoint.
-4. Перевести БД с обязательных Outlook IDs на нейтральную source identity.
-5. Подключить native reader и VSTO к единой installer/release-сборке.
-
-## Итог
-
-C++ Extended MAPI reader нужен и выбран осмысленно: он является локальным
-Outlook-specific источником данных и позволяет читать настроенные stores без
-Outlook Object Model ingestion.
-
-Python search core уже не управляет Outlook, а source-specific код физически
-изолирован в connector. Вокруг первоначального эксперимента остаются логические
-швы: Outlook-shaped API и база, общий spool и незавершённая installer/release-сборка.
-
-Правильное направление — сохранить MAPI reader как connector и сделать внутренний
-документный контракт независимым от способа получения данных.
+Оставшийся graph минимален для поставленной задачи: UI/host, source connector и
+поисковый сервис. Installer/release packaging, incremental checkpoints,
+notifications и reconciliation удалённых писем остаются отдельными следующими
+задачами и не требуют возвращать adapter-слой.

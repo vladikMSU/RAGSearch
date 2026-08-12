@@ -3,17 +3,25 @@
 Экспериментальный локальный поиск по почте, совместимый с classic Microsoft Outlook
 для Windows x64.
 VSTO-надстройка показывает собственную нижнюю WinForms-панель поиска и результатов,
-отдельный C++ reader читает настроенный Outlook profile через read-only Extended
-MAPI, а Python-сервис индексирует письма и вложения в SQLite/FTS5. Штатные строка
-поиска и список писем Outlook при этом не изменяются.
+напрямую управляет отдельным C++ reader-ом для read-only Extended MAPI и отправляет
+нейтральные документы в Python search service. Штатные строка поиска и список
+писем Outlook при этом не изменяются.
 
 ```text
-classic Outlook + нижняя VSTO-панель ◄──HTTP──► Python search service ◄──HTTP── Python adapter ◄──JSONL── C++ Extended MAPI reader
-          │                                      │                                                       ▲
-          │ двойной щелчок: StoreID + EntryID    ▼                                                       │
-          ▼                                SQLite + FTS5 + embeddings                         Outlook profile/providers
+                                     ┌── запуск/stop ──► C++ Extended MAPI reader ──► Outlook profile
+classic Outlook + нижняя VSTO-панель ┤                    │
+          │                          │◄── Outlook JSONL ──┘
+          │                          └── neutral HTTP /v1/documents + /v1/search ──► Python service
+          │                                                                       │
+          │ locator: StoreID + EntryID                                SQLite + FTS5 + embeddings
+          ▼
    исходное письмо
 ```
+
+Между C++ и Python нет прямой связи, общего каталога обмена или adapter-процесса.
+VSTO последовательно преобразует source-specific JSONL в `Document`; Outlook IDs
+находятся только в opaque `locator`, который сервис хранит и возвращает без
+интерпретации.
 
 Extended MAPI здесь не является скачанным Python-пакетом. Во время сборки
 используются закреплённые в репозитории официальные Microsoft headers; линковочные
@@ -30,13 +38,13 @@ Extended MAPI здесь не является скачанным Python-пак�
 - единая MSBuild solution; native EXE собирается в
   `connectors\outlook_mapi\native\bin\x64\<Configuration>\OutlookMapiReader.exe`.
 
-Source-specific Outlook ingestion собран в `connectors/outlook_mapi`, а
-`service/ragsearch_service` содержит только локальный search service. VSTO host
-находится в `hosts/outlook_vsto`; экспериментальная Outlook Object Model
-диагностика из production tree удалена.
+Source-specific native reader находится в `connectors/outlook_mapi`, а
+`service/ragsearch_service` содержит только source-neutral локальный search
+service. VSTO host находится в `hosts/outlook_vsto`; прежние Python adapter и
+экспериментальная Outlook Object Model диагностика из production tree удалены.
 
-В Git намеренно не хранятся `.venv`, build artifacts, база, письма, вложения,
-токены, private signing keys и необязательная neural model.
+В Git намеренно не хранятся `.venv`, build artifacts, база, письма, временные
+вложения, токены, private signing keys и необязательная neural model.
 
 ## Требования
 
@@ -93,7 +101,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 `
 нормальный installer и сертификат, которому доверяет целевая организация;
 репозиторий их не содержит. Автоматически созданный сертификат также может
 потребовать явного доверия в соответствии с локальной ClickOnce/Office policy.
-Прямой запуск reader и connector tests описаны в
+Прямой диагностический запуск reader-а описан в
 [connectors/outlook_mapi/README.md](connectors/outlook_mapi/README.md).
 
 ## Запуск
@@ -102,7 +110,7 @@ Python-сервис можно запустить вручную:
 
 ```powershell
 Push-Location .\service
-.\.venv\Scripts\python.exe -m ragsearch_service --delete-spool-after-ingest
+.\.venv\Scripts\python.exe -m ragsearch_service
 Pop-Location
 ```
 
@@ -110,22 +118,27 @@ Pop-Location
 не запущен, панель сама использует точный workspace-путь
 `service\.venv\Scripts\python.exe`; при отсутствии локальной neural model включается
 воспроизводимый hashing provider без дополнительных зависимостей.
+Health handshake проверяет protocol `4`: если порт 8765 ещё занят старым процессом
+RAGSearch service, панель сообщает о несовместимости вместо отправки нового DTO в
+старый endpoint.
 Непустой индекс привязан к одной embedding-модели и размерности: при смене
 конфигурации сервис требует явной очистки индекса и полной переиндексации.
 
 Результаты появляются в закреплённой снизу таблице RAG Search в том же порядке,
 в котором их вернул backend; максимум — 25 писем. Двойной щелчок по строке открывает
-исходный Outlook `MailItem` по точной паре `StoreID + EntryID`. Панель подбирает
+исходный Outlook `MailItem` по точной паре `StoreID + EntryID` из opaque locator.
+Панель подбирает
 светлую или тёмную WinForms-палитру по системной теме, умеет сворачиваться и
 отделяться в плавающее окно. Обычные Search bar, текущая папка и список Outlook
 остаются без изменений.
 
-Ручной потоковый импорт:
+Reader можно запустить отдельно для диагностики его MAPI/JSONL boundary. Такой
+запуск ничего не отправляет в search service:
 
 ```powershell
-.\service\.venv\Scripts\python.exe .\connectors\outlook_mapi\adapter.py `
-  --executable .\connectors\outlook_mapi\native\bin\x64\Debug\OutlookMapiReader.exe `
-  --full-scan
+.\connectors\outlook_mapi\native\bin\x64\Debug\OutlookMapiReader.exe `
+  --jsonl --max-stores 1 --max-folders 10 --max-messages 5 `
+  --body-preview-chars 2000
 ```
 
 Необязательные `sentence-transformers` и multilingual model не включены в Git и
@@ -138,27 +151,21 @@ Pop-Location
 .\service\.venv\Scripts\python.exe -B -m unittest `
   discover -s service\tests -t service -v
 
-.\service\.venv\Scripts\python.exe -B -m unittest `
-  discover -s connectors\outlook_mapi\tests -t . -v
-
 .\connectors\outlook_mapi\native\bin\x64\Debug\OutlookMapiReader.exe --help
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\connectors\outlook_mapi\tests\test_reader_smoke.ps1 `
+  -Configuration Debug -OfflineOnly
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 `
   -Target Rebuild
 ```
 
-Live E2E требует реального Outlook profile и подготовленного тестового store, поэтому
-не является универсальным тестом чистого clone:
-
-```powershell
-powershell.exe -NoProfile -File `
-  .\connectors\outlook_mapi\tests\test_adapter_e2e.ps1
-```
-
-Текущая структурная проверка: 27/27 service tests, 14/14 connector tests,
-канонический полный `Debug|x64` Rebuild и штатный v143 `Release|x64` Rebuild
-`OutlookMapiReader` — PASS.
-Live E2E с реальным Outlook profile и временной schema v3 БД — PASS.
+Live MAPI-проверка требует реального Outlook profile и поэтому не является
+универсальным тестом чистого clone; её команда и bounded параметры приведены в
+connector README. Актуальные результаты автоматических тестов и сборки фиксируются
+после каждого изменения контракта, а не поддерживаются как вручную подсчитанная
+цифра в документации.
 
 ## Честные ограничения
 

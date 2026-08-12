@@ -1,12 +1,17 @@
 # RAGSearch local service
 
-Dependency-free Python service for Outlook message ingestion and message-level hybrid search. It stores each message and attachment independently, uses deterministic chunks, combines SQLite FTS5 with embeddings, and always returns Outlook navigation identity (`entry_id`, `store_id`, `folder_entry_id`). It never concatenates a mailbox into one document.
+Dependency-free Python service for source-neutral document ingestion and hybrid
+search. Producers send complete document snapshots over loopback HTTP. The service
+does not know how a document was acquired and does not interpret connector locators.
+
+It stores documents and their parts independently, creates deterministic chunks,
+combines SQLite FTS5 with embeddings, and returns the producer's opaque `locator`
+unchanged with every search result.
 
 ## Run
 
-Python 3.11 or newer is required. The default provider uses no downloads and no third-party packages.
-The default Windows data layout requires a non-empty `LOCALAPPDATA`; use
-`--data-dir` for an explicit isolated location.
+Python 3.11 or newer is required. The default embedding provider uses no downloads
+and no third-party packages.
 
 ```powershell
 Push-Location .\service
@@ -18,9 +23,15 @@ The server binds only to `127.0.0.1:8765`. On first start it creates:
 
 - `%LOCALAPPDATA%\RAGSearch\ragsearch.sqlite3`
 - `%LOCALAPPDATA%\RAGSearch\service-token`
-- `%LOCALAPPDATA%\RAGSearch\spool\`
 
-The token is generated atomically. On Windows the service removes inherited ACEs from its data/spool roots and grants full control only to the current user, SYSTEM and Administrators; on POSIX it applies user-only modes. Startup fails instead of silently continuing if the Windows ACL cannot be hardened. The VSTO add-in reads the token and sends it in `X-RAGSearch-Token`; the token is never accepted in a URL.
+There is no service spool. Binary part content crosses the API inline as base64; no
+producer filesystem path is accepted by the service.
+
+The token is generated atomically. On Windows the service removes inherited ACEs
+from its data root and grants full control only to the current user, SYSTEM and
+Administrators; on POSIX it applies user-only modes. Startup fails if the data path
+cannot be hardened. Clients send the token in `X-RAGSearch-Token`; it is never
+accepted in a URL.
 
 For an isolated development instance:
 
@@ -32,106 +43,152 @@ Pop-Location
 
 ## API
 
-`GET /health` is deliberately minimal and does not require a token. Every `/v1/*` endpoint requires `X-RAGSearch-Token`.
+`GET /health` does not require a token and returns the compatibility contract used
+by clients before they reuse a running process:
 
-### Ingest complete message snapshots
+```json
+{"status":"ok","protocol":4}
+```
 
-`POST /v1/messages`
+Every `/v1/*` endpoint requires `X-RAGSearch-Token`.
+
+### Upsert one complete document snapshot
+
+`POST /v1/documents`
+
+The JSON body is one document directly, not a batch wrapper:
 
 ```json
 {
-  "messages": [
+  "source_key": "outlook_mapi:<64-hex-sha256>",
+  "kind": "email",
+  "title": "Quarterly launch plan",
+  "metadata": {
+    "sender_name": "Alex",
+    "sender_email": "alex@example.test",
+    "to": "user@example.test",
+    "cc": "",
+    "sent_at": "2026-08-11T09:00:00Z",
+    "received_at": "2026-08-11T09:01:00Z",
+    "modified_at": "2026-08-11T09:02:00Z",
+    "folder_path": "Mailbox - User/Inbox",
+    "store_name": "Mailbox - User",
+    "internet_message_id": "<example@example.test>",
+    "conversation_id": "conversation-id"
+  },
+  "locator": {
+    "connector": "outlook_mapi",
+    "store_id": "outlook-store-id",
+    "entry_id": "outlook-entry-id",
+    "folder_entry_id": "outlook-folder-id"
+  },
+  "parts": [
     {
-      "entry_id": "outlook-entry-id",
-      "store_id": "outlook-store-id",
-      "folder_entry_id": "outlook-folder-id",
-      "folder_path": "\\Mailbox - User\\Inbox",
-      "store_name": "Mailbox - User",
-      "subject": "Quarterly launch plan",
-      "sender_name": "Alex",
-      "sender_email": "alex@example.test",
-      "to": "user@example.test",
-      "cc": "",
-      "sent_at": "2026-08-11T09:00:00Z",
-      "received_at": "2026-08-11T09:01:00Z",
-      "modified_at": "2026-08-11T09:02:00Z",
-      "internet_message_id": "<example@example.test>",
-      "conversation_id": "conversation-id",
-      "body": "The launch was moved to October.",
-      "attachments": [
-        {
-          "name": "notes.txt",
-          "size": 4096,
-          "content_type": "text/plain",
-          "temp_path": "C:\\Users\\user\\AppData\\Local\\RAGSearch\\spool\\notes.txt"
-        }
-      ]
+      "key": "body",
+      "kind": "body",
+      "name": "body",
+      "media_type": "text/plain",
+      "size": 32,
+      "text": "The launch was moved to October.",
+      "truncated": false
+    },
+    {
+      "key": "attachment:0",
+      "kind": "attachment",
+      "name": "notes.txt",
+      "media_type": "text/plain",
+      "size": 12,
+      "content_base64": "SGVsbG8gd29ybGQh"
     }
   ]
 }
 ```
 
+Required document fields are `source_key`, `kind`, `title`, `metadata`, `locator`
+and `parts`. `metadata` and `locator` must be JSON objects. They are serialized
+canonically for storage, but their JSON value is otherwise opaque to the core.
+`title` is limited to 65,536 characters so even a full 25-result response remains
+within the host's bounded response envelope.
+All request strings and JSON object keys must contain Unicode scalar values;
+unpaired UTF-16 surrogate code points are rejected with HTTP 400. Valid astral
+characters, including emoji and JSON surrogate-pair escapes, are accepted.
+Numbers inside opaque metadata/locator must fit the finite IEEE-754 `Double`
+range understood by the .NET host. Large finite values such as `1e100` are
+accepted; integer precision beyond `Double` precision is not promised.
+Canonical metadata is limited to 1 MiB and canonical locator data to 64 KiB,
+measured as UTF-8 JSON. Each object is also limited to depth 16 and 10,000 JSON
+nodes. The reserved key `__type` is rejected because the .NET Framework wire
+serializer interprets it as runtime type metadata; all other keys remain opaque.
+
+Each part requires a non-empty `key` and `kind`. Optional fields are `name`,
+`media_type`, `size`, `truncated`, `text` and `content_base64`. `text` and
+`content_base64` are mutually exclusive. When base64 is provided, its decoded byte
+length must equal `size`. Omitting both stores part metadata without extracted text.
+
+The default decoded binary limit is 8 MiB per part. The HTTP request limit is
+48 MiB measured over the fully serialized UTF-8 body; the VSTO host applies the
+same byte limit before sending. Text, HTML,
+JSON/XML/CSV/log/Markdown and DOCX content is
+extracted with the standard library. Unsupported formats are recorded as
+`unsupported` but their document metadata remains searchable. Searchable text
+extracted from one binary part is capped at 8 MiB characters, and all
+binary-derived text in one document shares the same 8 MiB aggregate budget. The
+synthesized metadata search projection is capped at 4 MiB characters without
+changing stored metadata or part rows. Producer-supplied `text` is preserved
+exactly. It is indexed first and returns HTTP 400 if it alone exceeds a hard
+per-document limit; derived metadata and binary projections are then
+deterministically cropped to the remaining capacity instead of rejecting the
+document. The hard limits are 16 Mi characters and 16,384 chunks. Search queries
+are limited to 8,192 characters. Together these bounds prevent a valid request
+from expanding into unbounded embedding work while keeping the Outlook host
+envelope admissible.
+
 Response:
 
 ```json
-{"accepted":1,"failed":0,"errors":[]}
+{"source_key":"outlook_mapi:<64-hex-sha256>","status":"upserted"}
 ```
 
-Identity is the composite `(store_id, entry_id)`. Retrying the same item updates it, replaces only that message's chunks/attachments, and removes stale attachments. A bad item does not roll back other items in the batch.
-
-`to` and `cc` are a single canonical string or `null`; recipient arrays are not
-accepted. Each timestamp is either `null` or a non-empty ISO-8601 string with a
-`T` separator and explicit UTC offset (`Z` is accepted). Naive and empty values
-are rejected. The service converts accepted timestamps to fixed-width UTC such
-as `2026-08-11T09:01:00.000000Z` before storing or returning them.
-
-Attachment paths are resolved (including symlinks) and rejected unless they remain inside the configured spool. Text, HTML, JSON/XML/CSV/log/Markdown and DOCX are extracted with the standard library. Unsupported formats remain searchable by message metadata but are recorded as `unsupported`. The default extraction limit is 64 MiB per attachment. Spool files are retained unless `--delete-spool-after-ingest` is explicitly set; with that flag deletion occurs only after commit.
+`source_key` is the sole public identity. Retrying it updates the document and
+replaces only that document's parts and chunks, so removed parts do not remain in
+the index. Invalid requests return HTTP 400. The removed `/v1/messages` endpoint
+has no compatibility alias and returns HTTP 404.
 
 ### Search
 
 `POST /v1/search`
 
 ```json
-{
-  "query": "when was the product launch moved",
-  "limit": 20,
-  "filters": {
-    "store_id": "outlook-store-id",
-    "folder_path_prefix": "\\Mailbox - User\\Inbox",
-    "received_from": "2026-01-01T00:00:00Z",
-    "has_attachments": true
-  }
-}
+{"query":"when was the product launch moved","limit":20}
 ```
 
-Supported filters: `store_id`, `store_ids`, `folder_entry_id`, `folder_path`, `folder_path_prefix`, `sender_email`, `received_from`, `received_to`, `has_attachments`.
-`received_from` and `received_to` use the same strict timestamp grammar and are
-normalized to UTC before their inclusive comparisons. Omitting `filters` searches
-every indexed OST/PST store.
+Only `query` and `limit` are accepted. Source-specific filters are deliberately not
+part of the neutral core contract.
 
-Response fields are stable for VSTO navigation:
+The response contains generic document fields and the opaque producer data:
+
+The current Outlook host bounds its producer title to 65,536 characters and reads
+this response as strict UTF-8 through a 128 MiB streaming/parser cap.
 
 ```json
 {
   "results": [
     {
-      "entry_id": "outlook-entry-id",
-      "store_id": "outlook-store-id",
-      "folder_entry_id": "outlook-folder-id",
-      "subject": "Quarterly launch plan",
-      "sender_name": "Alex",
-      "sender_email": "alex@example.test",
-      "received_at": "2026-08-11T09:01:00.000000Z",
-      "folder_path": "\\Mailbox - User\\Inbox",
+      "source_key": "outlook_mapi:<64-hex-sha256>",
+      "kind": "email",
+      "title": "Quarterly launch plan",
+      "metadata": {"sender_name":"Alex","received_at":"2026-08-11T09:01:00Z"},
+      "locator": {"connector":"outlook_mapi","store_id":"...","entry_id":"..."},
+      "rank": 1,
+      "snippet": "The launch was moved to October.",
+      "snippet_part": "body",
+      "matched_parts": ["body", "attachment:notes.txt"],
       "hybrid_score": 0.91,
       "lexical_score": 0.74,
       "lexical_match_kind": "token",
       "vector_similarity": 0.77,
       "vector_distance": 0.23,
-      "rank": 1,
-      "ranking_basis": "lexical_token",
-      "snippet": "The launch was moved to October.",
-      "matched_sources": ["body", "attachment:notes.txt"]
+      "ranking_basis": "lexical_token"
     }
   ],
   "mode": "hybrid-semantic",
@@ -146,112 +203,61 @@ Response fields are stable for VSTO navigation:
 }
 ```
 
-The service aggregates the best chunk per Outlook message before selecting the
-message candidate pools. `vector_similarity` is the best indexed chunk
-cosine and `vector_distance = 1 - vector_similarity`. For multi-token queries,
-literal matches are followed by semantic candidates ordered by distance, using
-an adaptive cutoff (`max(model floor, best similarity - 0.10)`) and a hard cap of
-25 messages. The dense-model floor is `0.40`; the hashing provider uses `0.30`
-because cosine distributions are model-specific.
+Results are aggregated per document. Literal retrieval uses both the FTS5
+`unicode61` token index and a trigram index. The vector and lexical ranking behavior
+is unchanged from the message index: prefix/substring evidence enables the lexical
+gate, single-token queries require literal evidence, and multi-token semantic
+results use an adaptive model-specific cosine cutoff. `snippet_part` identifies the
+exact chunk label used to produce `snippet`; `matched_parts` remains the aggregate
+of matched labels for the document. The service returns at most 25 documents.
 
-Literal retrieval uses both the `unicode61` token index and an FTS5 `trigram`
-index. `lexical_match_kind` is `token`, `prefix`, `substring`, or empty. A
-prefix/substring hit enables `lexical_gate` and excludes unrelated dense guesses;
-for a single-token query any literal hit wins, while a single token with no
-literal evidence returns `mode=single-token-no-literal`. This avoids the observed
-short-query pathology where the multilingual paraphrase model ranked an unrelated
-four-letter body above `киберспорт`. Existing databases must already use schema v3;
-older schemas are rejected at startup and must be rebuilt. `DELETE /v1/index`
-clears both FTS indexes. Sources remain `message_metadata`, `body`, or
-`attachment:<name>`.
+### Stats and reset
 
-### Stats
+`GET /v1/stats` returns `documents`, `parts`, `chunks`, `part_extraction`, schema
+version, database size, and the active embedding model contract.
 
-`GET /v1/stats` returns message, attachment and chunk counts, extraction status
-counts, schema version, and the active embedding model, dimension, and immutable
-implementation/artifact fingerprint.
-
-### Clear the local index
-
-`DELETE /v1/index` atomically removes all messages, attachments, chunks, FTS
-entries, and embedding contract metadata from the local database. It keeps the
-database file, schema, service token, and spool files unchanged, and does not run
-`VACUUM`. Clearing the embedding metadata is deliberate: the next ingestion fixes
-a new model contract for the now-empty index. The endpoint requires
-`X-RAGSearch-Token` like every other `/v1/*` route.
-
-Response:
+`DELETE /v1/index` atomically removes all documents, parts, chunks, FTS entries and
+embedding contract metadata. It keeps the database file, schema and token. Response:
 
 ```json
-{"deleted_messages":42,"deleted_attachments":49,"deleted_chunks":1877}
+{"deleted_documents":42,"deleted_parts":49,"deleted_chunks":1877}
 ```
 
-Calling it again is safe and returns zero counts.
+Calling it again is safe and returns zero counters. Schema v4 is a clean break;
+older databases are rejected at startup and should be deleted and re-indexed.
 
 ## Embeddings
 
-The default `hashing-v1-256` provider hashes word, bigram and character features into a normalized deterministic vector. It is lightweight and reproducible but is not a neural language model.
-
-An optional locally cached sentence-transformers model can be selected explicitly:
-
-```powershell
-Push-Location .\service
-.\.venv\Scripts\python.exe -m pip install "sentence-transformers==5.7.0"
-.\.venv\Scripts\python.exe -m ragsearch_service `
-  --embedding sentence-transformers `
-  --model path\to\local-model
-Pop-Location
-```
-
-`local_files_only=True` is enforced, so starting the service does not download a
-model. The first ingestion fixes one provider name, dimension, and immutable
-fingerprint for the whole index. The hashing fingerprint covers its feature
-algorithm and Unicode database version. The neural fingerprint hashes every file
-in the resolved local model snapshot plus the embedding runtime package versions.
-Replacing model weights at the same path therefore cannot silently mix vectors.
-Starting against a non-empty index with another contract fails immediately;
-switch models only after `DELETE /v1/index`, then re-ingest every message.
-
-The conventional ignored workspace location for the multilingual model is:
-
-```text
-<repo-root>\service\models\paraphrase-multilingual-MiniLM-L12-v2
-```
-
-Run the neural configuration from the repository root:
+The default `hashing-v1-256` provider hashes word, bigram and character features
+into a normalized deterministic vector. An optional locally cached
+sentence-transformers model can be selected explicitly:
 
 ```powershell
 Push-Location .\service
 .\.venv\Scripts\python.exe -m ragsearch_service `
   --embedding sentence-transformers `
-  --model .\models\paraphrase-multilingual-MiniLM-L12-v2 `
-  --delete-spool-after-ingest
+  --model .\models\paraphrase-multilingual-MiniLM-L12-v2
 Pop-Location
 ```
 
-The model is loaded with `local_files_only=True`; `service/models/` is intentionally ignored rather than committed. Its model card documents 50-language, 384-dimensional sentence embeddings: [paraphrase-multilingual-MiniLM-L12-v2](https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2).
-
-## Outlook MAPI connector
-
-Source-specific ingestion is intentionally outside the search service, in
-[`connectors/outlook_mapi`](../connectors/outlook_mapi/README.md). Its adapter streams
-the reader's JSONL contract into this service through the public `/v1/messages` HTTP
-boundary.
+`local_files_only=True` is enforced. The first ingestion fixes one provider name,
+dimension and immutable fingerprint for the whole index. Switch models only after
+`DELETE /v1/index`, then re-ingest every document.
 
 ## Tests
 
 ```powershell
 Push-Location .\service
-.\.venv\Scripts\python.exe -m unittest discover -s tests -t . -v
+.\.venv\Scripts\python.exe -B -m unittest discover -s tests -t . -v
 Pop-Location
 ```
 
-Tests use explicit temporary data/token/spool directories and do not touch the default `%LOCALAPPDATA%\RAGSearch` state.
-
-The service tests are independent from the connector tests and use only explicit
-temporary paths. Connector validation commands are documented in the connector
-README.
+Tests use explicit temporary data and token paths and do not touch default
+`%LOCALAPPDATA%\RAGSearch` state.
 
 ## Scale note
 
-The stdlib vector path performs a streaming brute-force cosine scan with a bounded top-k heap. It keeps memory bounded and is appropriate for the local prototype, but a multi-year 100 GB archive will eventually need an ANN-backed provider (for example sqlite-vec) behind the same search interface. SQLite FTS5 and all metadata filters are indexed independently.
+The standard-library vector path performs a streaming brute-force cosine scan with
+a bounded top-k heap. It keeps memory bounded and is appropriate for the local
+prototype. A large archive will eventually need an ANN-backed implementation behind
+the same search interface; SQLite FTS5 remains independent.

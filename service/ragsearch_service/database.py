@@ -2,21 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import heapq
+import json
 import re
 import sqlite3
-from contextlib import contextmanager
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .chunking import normalize_text
 from .embeddings import Embedder, blob_to_vector, cosine_for_normalized, vector_to_blob
-from .errors import ValidationError
-from .timestamps import canonical_utc_timestamp
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _SEARCH_TOKEN = re.compile(r"[\w@.+-]+", re.UNICODE)
 
 
@@ -26,10 +25,6 @@ def _utc_now() -> str:
 
 def _sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _escape_like(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class Database:
@@ -70,59 +65,45 @@ class Database:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
-                CREATE TABLE IF NOT EXISTS messages (
+                CREATE TABLE IF NOT EXISTS documents (
                     id INTEGER PRIMARY KEY,
-                    entry_id TEXT NOT NULL,
-                    store_id TEXT NOT NULL,
-                    folder_entry_id TEXT NOT NULL,
-                    folder_path TEXT NOT NULL DEFAULT '',
-                    store_name TEXT NOT NULL DEFAULT '',
-                    subject TEXT NOT NULL DEFAULT '',
-                    sender_name TEXT NOT NULL DEFAULT '',
-                    sender_email TEXT NOT NULL DEFAULT '',
-                    to_recipients TEXT NOT NULL DEFAULT '',
-                    cc_recipients TEXT NOT NULL DEFAULT '',
-                    sent_at TEXT,
-                    received_at TEXT,
-                    modified_at TEXT,
-                    internet_message_id TEXT NOT NULL DEFAULT '',
-                    conversation_id TEXT NOT NULL DEFAULT '',
-                    body_hash TEXT NOT NULL DEFAULT '',
+                    source_key TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL,
+                    locator_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE (store_id, entry_id)
+                    updated_at TEXT NOT NULL
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_messages_folder
-                    ON messages (store_id, folder_entry_id);
-                CREATE INDEX IF NOT EXISTS idx_messages_received
-                    ON messages (received_at);
-                CREATE INDEX IF NOT EXISTS idx_messages_sender
-                    ON messages (sender_email);
+                CREATE INDEX IF NOT EXISTS idx_documents_kind
+                    ON documents (kind);
 
-                CREATE TABLE IF NOT EXISTS attachments (
+                CREATE TABLE IF NOT EXISTS parts (
                     id INTEGER PRIMARY KEY,
-                    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                    attachment_index INTEGER NOT NULL,
+                    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    part_key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
                     name TEXT NOT NULL DEFAULT '',
+                    media_type TEXT NOT NULL DEFAULT '',
                     declared_size INTEGER NOT NULL DEFAULT 0,
-                    content_type TEXT NOT NULL DEFAULT '',
+                    truncated INTEGER NOT NULL DEFAULT 0 CHECK (truncated IN (0, 1)),
                     extraction_status TEXT NOT NULL,
                     extraction_error TEXT,
                     text_hash TEXT NOT NULL DEFAULT '',
-                    UNIQUE (message_id, attachment_index)
+                    UNIQUE (document_id, part_key)
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_attachments_message
-                    ON attachments (message_id);
+                CREATE INDEX IF NOT EXISTS idx_parts_document
+                    ON parts (document_id);
 
                 CREATE TABLE IF NOT EXISTS chunks (
                     id INTEGER PRIMARY KEY,
-                    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-                    attachment_id INTEGER REFERENCES attachments(id) ON DELETE CASCADE,
-                    source_key TEXT NOT NULL,
-                    source_kind TEXT NOT NULL CHECK (source_kind IN ('metadata', 'body', 'attachment')),
-                    source_label TEXT NOT NULL,
+                    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                    part_id INTEGER REFERENCES parts(id) ON DELETE CASCADE,
+                    part_key TEXT NOT NULL,
+                    part_kind TEXT NOT NULL,
+                    part_label TEXT NOT NULL,
                     ordinal INTEGER NOT NULL,
                     text TEXT NOT NULL,
                     text_hash TEXT NOT NULL,
@@ -130,11 +111,11 @@ class Database:
                     embedding_model TEXT NOT NULL,
                     embedding_dim INTEGER NOT NULL,
                     embedding_fingerprint TEXT NOT NULL,
-                    UNIQUE (message_id, source_key, ordinal)
+                    UNIQUE (document_id, part_key, ordinal)
                 );
 
-                CREATE INDEX IF NOT EXISTS idx_chunks_message
-                    ON chunks (message_id);
+                CREATE INDEX IF NOT EXISTS idx_chunks_document
+                    ON chunks (document_id);
                 CREATE INDEX IF NOT EXISTS idx_chunks_embedding
                     ON chunks (embedding_model, embedding_dim, embedding_fingerprint);
 
@@ -243,20 +224,16 @@ class Database:
             self._validate_embedding_contract(connection, embedder)
 
     def clear_index(self) -> dict[str, int]:
-        """Delete indexed Outlook data atomically while keeping the database itself."""
+        """Delete indexed documents atomically while keeping the database itself."""
         with self.session() as connection:
             connection.execute("BEGIN IMMEDIATE")
             counts = {
                 table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-                for table in ("messages", "attachments", "chunks")
+                for table in ("documents", "parts", "chunks")
             }
-
-            # Delete children explicitly so the FTS delete trigger runs for every
-            # chunk. Rebuild then guarantees that the external-content FTS index
-            # exactly reflects the now-empty chunks table.
             connection.execute("DELETE FROM chunks")
-            connection.execute("DELETE FROM attachments")
-            connection.execute("DELETE FROM messages")
+            connection.execute("DELETE FROM parts")
+            connection.execute("DELETE FROM documents")
             connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('rebuild')")
             connection.execute(
                 "INSERT INTO chunks_trigram(chunks_trigram) VALUES ('rebuild')"
@@ -264,15 +241,15 @@ class Database:
             connection.execute("DELETE FROM service_meta")
 
         return {
-            "deleted_messages": counts["messages"],
-            "deleted_attachments": counts["attachments"],
+            "deleted_documents": counts["documents"],
+            "deleted_parts": counts["parts"],
             "deleted_chunks": counts["chunks"],
         }
 
-    def upsert_message(
+    def upsert_document(
         self,
-        message: dict[str, Any],
-        attachments: Sequence[dict[str, Any]],
+        document: dict[str, Any],
+        parts: Sequence[dict[str, Any]],
         chunks: Sequence[dict[str, Any]],
         *,
         embedder: Embedder,
@@ -298,103 +275,83 @@ class Database:
                     "VALUES ('embedding_fingerprint', ?)",
                     (embedder.fingerprint,),
                 )
+
             connection.execute(
                 """
-                INSERT INTO messages (
-                    entry_id, store_id, folder_entry_id, folder_path, store_name,
-                    subject, sender_name, sender_email, to_recipients, cc_recipients,
-                    sent_at, received_at, modified_at, internet_message_id,
-                    conversation_id, body_hash, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(store_id, entry_id) DO UPDATE SET
-                    folder_entry_id=excluded.folder_entry_id,
-                    folder_path=excluded.folder_path,
-                    store_name=excluded.store_name,
-                    subject=excluded.subject,
-                    sender_name=excluded.sender_name,
-                    sender_email=excluded.sender_email,
-                    to_recipients=excluded.to_recipients,
-                    cc_recipients=excluded.cc_recipients,
-                    sent_at=excluded.sent_at,
-                    received_at=excluded.received_at,
-                    modified_at=excluded.modified_at,
-                    internet_message_id=excluded.internet_message_id,
-                    conversation_id=excluded.conversation_id,
-                    body_hash=excluded.body_hash,
+                INSERT INTO documents (
+                    source_key, kind, title, metadata_json, locator_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    kind=excluded.kind,
+                    title=excluded.title,
+                    metadata_json=excluded.metadata_json,
+                    locator_json=excluded.locator_json,
                     updated_at=excluded.updated_at
                 """,
                 (
-                    message["entry_id"],
-                    message["store_id"],
-                    message["folder_entry_id"],
-                    message["folder_path"],
-                    message["store_name"],
-                    message["subject"],
-                    message["sender_name"],
-                    message["sender_email"],
-                    message["to"],
-                    message["cc"],
-                    message["sent_at"],
-                    message["received_at"],
-                    message["modified_at"],
-                    message["internet_message_id"],
-                    message["conversation_id"],
-                    message["body_hash"],
+                    document["source_key"],
+                    document["kind"],
+                    document["title"],
+                    document["metadata_json"],
+                    document["locator_json"],
                     now,
                     now,
                 ),
             )
-            message_id = connection.execute(
-                "SELECT id FROM messages WHERE store_id = ? AND entry_id = ?",
-                (message["store_id"], message["entry_id"]),
-            ).fetchone()[0]
+            document_id = int(
+                connection.execute(
+                    "SELECT id FROM documents WHERE source_key = ?",
+                    (document["source_key"],),
+                ).fetchone()[0]
+            )
 
-            # Every API item is a complete message snapshot. Replacing its children
-            # makes retries idempotent and removes attachments deleted in Outlook.
-            connection.execute("DELETE FROM chunks WHERE message_id = ?", (message_id,))
-            connection.execute("DELETE FROM attachments WHERE message_id = ?", (message_id,))
+            # Each request is a complete document snapshot.  Replacing children
+            # makes retries idempotent and removes parts missing from a later snapshot.
+            connection.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
+            connection.execute("DELETE FROM parts WHERE document_id = ?", (document_id,))
 
-            attachment_ids: dict[int, int] = {}
-            for attachment in attachments:
+            part_ids: dict[str, int] = {}
+            for part in parts:
                 cursor = connection.execute(
                     """
-                    INSERT INTO attachments (
-                        message_id, attachment_index, name, declared_size, content_type,
-                        extraction_status, extraction_error, text_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO parts (
+                        document_id, part_key, kind, name, media_type, declared_size,
+                        truncated, extraction_status, extraction_error, text_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        message_id,
-                        attachment["attachment_index"],
-                        attachment["name"],
-                        attachment["size"],
-                        attachment["content_type"],
-                        attachment["extraction_status"],
-                        attachment["extraction_error"],
-                        attachment["text_hash"],
+                        document_id,
+                        part["part_key"],
+                        part["kind"],
+                        part["name"],
+                        part["media_type"],
+                        part["size"],
+                        int(part["truncated"]),
+                        part["extraction_status"],
+                        part["extraction_error"],
+                        part["text_hash"],
                     ),
                 )
-                attachment_ids[attachment["attachment_index"]] = int(cursor.lastrowid)
+                part_ids[str(part["part_key"])] = int(cursor.lastrowid)
 
             for chunk in chunks:
-                attachment_index = chunk.get("attachment_index")
-                attachment_id = (
-                    attachment_ids[int(attachment_index)] if attachment_index is not None else None
-                )
+                part_key = str(chunk["part_key"])
+                part_id = part_ids.get(part_key) if part_key else None
                 connection.execute(
                     """
                     INSERT INTO chunks (
-                        message_id, attachment_id, source_key, source_kind, source_label,
+                        document_id, part_id, part_key, part_kind, part_label,
                         ordinal, text, text_hash, embedding, embedding_model,
                         embedding_dim, embedding_fingerprint
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        message_id,
-                        attachment_id,
-                        chunk["source_key"],
-                        chunk["source_kind"],
-                        chunk["source_label"],
+                        document_id,
+                        part_id,
+                        part_key,
+                        chunk["part_kind"],
+                        chunk["part_label"],
                         chunk["ordinal"],
                         chunk["text"],
                         _sha256(chunk["text"]),
@@ -404,89 +361,6 @@ class Database:
                         embedder.fingerprint,
                     ),
                 )
-
-    def _filters(self, filters: object) -> tuple[str, list[object]]:
-        if filters is None:
-            return "", []
-        if not isinstance(filters, dict):
-            raise ValidationError("filters must be an object")
-        allowed = {
-            "store_id",
-            "store_ids",
-            "folder_entry_id",
-            "folder_path",
-            "folder_path_prefix",
-            "sender_email",
-            "received_from",
-            "received_to",
-            "has_attachments",
-        }
-        unknown = set(filters) - allowed
-        if unknown:
-            raise ValidationError(f"Unknown search filters: {', '.join(sorted(unknown))}")
-
-        clauses: list[str] = []
-        parameters: list[object] = []
-
-        for name in ("store_id", "folder_entry_id", "folder_path"):
-            value = filters.get(name)
-            if value is not None:
-                if not isinstance(value, str):
-                    raise ValidationError(f"filters.{name} must be a string")
-                clauses.append(f"m.{name} = ?")
-                parameters.append(value)
-
-        store_ids = filters.get("store_ids")
-        if store_ids is not None:
-            if not isinstance(store_ids, list) or not store_ids or not all(
-                isinstance(item, str) and item for item in store_ids
-            ):
-                raise ValidationError("filters.store_ids must be a non-empty string array")
-            placeholders = ",".join("?" for _ in store_ids)
-            clauses.append(f"m.store_id IN ({placeholders})")
-            parameters.extend(store_ids)
-
-        folder_prefix = filters.get("folder_path_prefix")
-        if folder_prefix is not None:
-            if not isinstance(folder_prefix, str):
-                raise ValidationError("filters.folder_path_prefix must be a string")
-            clauses.append("m.folder_path LIKE ? ESCAPE '\\'")
-            parameters.append(_escape_like(folder_prefix) + "%")
-
-        sender_email = filters.get("sender_email")
-        if sender_email is not None:
-            if not isinstance(sender_email, str):
-                raise ValidationError("filters.sender_email must be a string")
-            clauses.append("LOWER(m.sender_email) = LOWER(?)")
-            parameters.append(sender_email)
-
-        for name, operator in (("received_from", ">="), ("received_to", "<=")):
-            if name not in filters:
-                continue
-            value = filters[name]
-            if not isinstance(value, str) or not value:
-                raise ValidationError(
-                    f"filters.{name} must be an ISO-8601 timestamp with a UTC offset"
-                )
-            try:
-                canonical = canonical_utc_timestamp(value)
-            except ValueError as exc:
-                raise ValidationError(
-                    f"filters.{name} must be an ISO-8601 timestamp with a UTC offset"
-                ) from exc
-            clauses.append(f"m.received_at {operator} ?")
-            parameters.append(canonical)
-
-        has_attachments = filters.get("has_attachments")
-        if has_attachments is not None:
-            if not isinstance(has_attachments, bool):
-                raise ValidationError("filters.has_attachments must be boolean")
-            predicate = "EXISTS" if has_attachments else "NOT EXISTS"
-            clauses.append(
-                f"{predicate} (SELECT 1 FROM attachments a WHERE a.message_id = m.id)"
-            )
-
-        return (" AND " + " AND ".join(clauses)) if clauses else "", parameters
 
     @staticmethod
     def _fts_expression(query: str) -> str:
@@ -537,21 +411,10 @@ class Database:
     def _row_payload(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "chunk_id": row["chunk_id"],
-            "message_id": row["message_id"],
+            "document_id": row["document_id"],
             "text": row["text"],
-            "source_kind": row["source_kind"],
-            "source_label": row["source_label"],
-            "entry_id": row["entry_id"],
-            "store_id": row["store_id"],
-            "folder_entry_id": row["folder_entry_id"],
-            "subject": row["subject"],
-            "sender_name": row["sender_name"],
-            "sender_email": row["sender_email"],
-            "received_at": row["received_at"],
-            "folder_path": row["folder_path"],
-            "store_name": row["store_name"],
-            "internet_message_id": row["internet_message_id"],
-            "conversation_id": row["conversation_id"],
+            "part_kind": row["part_kind"],
+            "part_label": row["part_label"],
         }
 
     @staticmethod
@@ -575,21 +438,19 @@ class Database:
         query: str,
         *,
         limit: int,
-        filters: object,
         embedder: Embedder,
         candidate_limit: int,
     ) -> list[dict[str, Any]]:
-        filter_sql, filter_parameters = self._filters(filters)
         query_vector = embedder.embed_many([query])[0]
         candidates: dict[int, dict[str, Any]] = {}
         select_fields = """
-            c.id AS chunk_id, c.message_id, c.text, c.source_kind, c.source_label,
-            m.entry_id, m.store_id, m.folder_entry_id, m.subject,
-            m.sender_name, m.sender_email, m.received_at, m.folder_path,
-            m.store_name, m.internet_message_id, m.conversation_id
+            c.id AS chunk_id, c.document_id, c.text, c.part_kind, c.part_label
         """
 
         with self.session() as connection:
+            # Keep chunk selection and the later document projection on one WAL
+            # read snapshot while ingestion/reset may write concurrently.
+            connection.execute("BEGIN")
             fts_expression = self._fts_expression(query)
             prefix_expression = self._prefix_expression(query)
             trigram_expression = self._trigram_expression(query)
@@ -607,13 +468,24 @@ class Database:
                            bm25({table_name}) AS lexical_rank
                     FROM {table_name}
                     JOIN chunks c ON c.id = {table_name}.rowid
-                    JOIN messages m ON m.id = c.message_id
-                    WHERE {table_name} MATCH ? {filter_sql}
+                    WHERE {table_name} MATCH ?
                     ORDER BY lexical_rank
                     LIMIT ?
                 """
-                parameters = [expression, *filter_parameters, candidate_limit]
-                rows = list(connection.execute(lexical_sql, parameters))
+                # FTS5's bm25() cannot be used through a window/CTE context.
+                # Over-fetch chunks, then retain the best one per document before
+                # applying the document candidate limit in Python.
+                chunk_limit = min(candidate_limit * 64, 100_000)
+                rows: list[sqlite3.Row] = []
+                seen_documents: set[int] = set()
+                for row in connection.execute(lexical_sql, [expression, chunk_limit]):
+                    document_id = int(row["document_id"])
+                    if document_id in seen_documents:
+                        continue
+                    seen_documents.add(document_id)
+                    rows.append(row)
+                    if len(rows) >= candidate_limit:
+                        break
                 maximum_score = max(
                     (max(0.0, -float(row["lexical_rank"])) for row in rows),
                     default=1.0,
@@ -654,17 +526,15 @@ class Database:
             vector_sql = f"""
                 SELECT {select_fields}, c.embedding
                 FROM chunks c
-                JOIN messages m ON m.id = c.message_id
                 WHERE c.embedding_model = ? AND c.embedding_dim = ?
-                  AND c.embedding_fingerprint = ? {filter_sql}
+                  AND c.embedding_fingerprint = ?
             """
             vector_parameters = [
                 embedder.name,
                 embedder.dimensions,
                 embedder.fingerprint,
-                *filter_parameters,
             ]
-            best_vector_chunk_by_message: dict[
+            best_vector_chunk_by_document: dict[
                 int, tuple[float, int, sqlite3.Row]
             ] = {}
             for row in connection.execute(vector_sql, vector_parameters):
@@ -677,14 +547,14 @@ class Database:
                     max(0.0, cosine_for_normalized(query_vector, stored)),
                 )
                 item = (similarity, int(row["chunk_id"]), row)
-                message_id = int(row["message_id"])
-                current = best_vector_chunk_by_message.get(message_id)
+                document_id = int(row["document_id"])
+                current = best_vector_chunk_by_document.get(document_id)
                 if current is None or item[:2] > current[:2]:
-                    best_vector_chunk_by_message[message_id] = item
+                    best_vector_chunk_by_document[document_id] = item
 
             vector_candidates = heapq.nlargest(
                 candidate_limit,
-                best_vector_chunk_by_message.values(),
+                best_vector_chunk_by_document.values(),
                 key=lambda item: item[:2],
             )
             for similarity, chunk_id, row in vector_candidates:
@@ -697,38 +567,55 @@ class Database:
                 existing["vector"] = max(float(existing.get("vector", 0.0)), similarity)
                 existing["vector_available"] = True
 
+            # Fetch the opaque document projection once per candidate document;
+            # never duplicate large metadata/locator JSON across chunk rows.
+            candidate_document_ids = sorted(
+                {int(item["document_id"]) for item in candidates.values()}
+            )
+            documents: dict[int, sqlite3.Row] = {}
+            if candidate_document_ids:
+                placeholders = ",".join("?" for _ in candidate_document_ids)
+                for row in connection.execute(
+                    "SELECT id, source_key, kind, title, metadata_json, locator_json "
+                    f"FROM documents WHERE id IN ({placeholders})",
+                    candidate_document_ids,
+                ):
+                    documents[int(row["id"])] = row
+            for candidate in candidates.values():
+                document = documents[int(candidate["document_id"])]
+                candidate["source_key"] = document["source_key"]
+                candidate["kind"] = document["kind"]
+                candidate["title"] = document["title"]
+                candidate["metadata_search"] = document["metadata_json"]
+                candidate["metadata_json"] = document["metadata_json"]
+                candidate["locator_json"] = document["locator_json"]
+
         folded_query = query.casefold()
         ranked_chunks: list[tuple[float, dict[str, Any]]] = []
         for candidate in candidates.values():
             score = 0.62 * candidate["vector"] + 0.38 * candidate["lexical"]
-            metadata = " ".join(
-                str(candidate[field])
-                for field in ("subject", "sender_name", "sender_email", "folder_path")
-                if candidate.get(field)
+            searchable_metadata = (
+                str(candidate["title"]) + " " + str(candidate["metadata_search"])
             ).casefold()
-            if folded_query in metadata:
+            if folded_query in searchable_metadata:
                 score += 0.12
             ranked_chunks.append((min(1.0, score), candidate))
-        ranked_chunks.sort(key=lambda item: (-item[0], item[1]["message_id"], item[1]["chunk_id"]))
+        ranked_chunks.sort(
+            key=lambda item: (-item[0], item[1]["document_id"], item[1]["chunk_id"])
+        )
 
-        by_message: dict[int, dict[str, Any]] = {}
+        by_document: dict[int, dict[str, Any]] = {}
         for score, candidate in ranked_chunks:
-            message_id = int(candidate["message_id"])
-            source = candidate["source_label"]
-            result = by_message.get(message_id)
+            document_id = int(candidate["document_id"])
+            part = candidate["part_label"]
+            result = by_document.get(document_id)
             if result is None:
                 result = {
-                    "entry_id": candidate["entry_id"],
-                    "store_id": candidate["store_id"],
-                    "folder_entry_id": candidate["folder_entry_id"],
-                    "subject": candidate["subject"],
-                    "sender_name": candidate["sender_name"],
-                    "sender_email": candidate["sender_email"],
-                    "received_at": candidate["received_at"],
-                    "folder_path": candidate["folder_path"],
-                    "store_name": candidate["store_name"],
-                    "internet_message_id": candidate["internet_message_id"],
-                    "conversation_id": candidate["conversation_id"],
+                    "source_key": candidate["source_key"],
+                    "kind": candidate["kind"],
+                    "title": candidate["title"],
+                    "metadata": json.loads(candidate["metadata_json"]),
+                    "locator": json.loads(candidate["locator_json"]),
                     "vector_similarity": float(candidate["vector"]),
                     "vector_available": bool(candidate.get("vector_available", False)),
                     "lexical_score": float(candidate["lexical"]),
@@ -737,9 +624,10 @@ class Database:
                     ),
                     "hybrid_score": float(score),
                     "snippet": self._snippet(candidate["text"], query),
-                    "matched_sources": [source],
+                    "snippet_part": part,
+                    "matched_parts": [part],
                 }
-                by_message[message_id] = result
+                by_document[document_id] = result
             else:
                 result["vector_similarity"] = max(
                     float(result["vector_similarity"]),
@@ -760,14 +648,17 @@ class Database:
                 ):
                     result["lexical_score"] = candidate_lexical
                     result["lexical_match_kind"] = candidate_kind
+                    if candidate_lexical > 0.0:
+                        result["snippet"] = self._snippet(candidate["text"], query)
+                        result["snippet_part"] = part
                 result["hybrid_score"] = max(
                     float(result["hybrid_score"]),
                     float(score),
                 )
-                if source not in result["matched_sources"] and len(result["matched_sources"]) < 8:
-                    result["matched_sources"].append(source)
+                if part not in result["matched_parts"] and len(result["matched_parts"]) < 8:
+                    result["matched_parts"].append(part)
 
-        results = list(by_message.values())
+        results = list(by_document.values())
         for result in results:
             similarity = min(1.0, max(0.0, float(result["vector_similarity"])))
             hybrid_score = min(1.0, max(0.0, float(result["hybrid_score"])))
@@ -783,8 +674,7 @@ class Database:
                 0 if bool(result["vector_available"]) else 1,
                 float(result["vector_distance"]),
                 -float(result["hybrid_score"]),
-                str(result["store_id"]),
-                str(result["entry_id"]),
+                str(result["source_key"]),
             )
         )
         vector_results = [result for result in results if bool(result["vector_available"])]
@@ -800,22 +690,19 @@ class Database:
                 0 if bool(result["vector_available"]) else 1,
                 float(result["vector_distance"]),
                 -float(result["hybrid_score"]),
-                str(result["store_id"]),
-                str(result["entry_id"]),
+                str(result["source_key"]),
             )
         )
 
-        # Keep independently bounded vector and lexical pools, then merge by
-        # Outlook identity. A current-model literal hit can have a weak cosine
-        # score (especially for a short query), so it must not be displaced by
-        # the vector top-K before the service-layer literal gate sees it.
+        # Keep independently bounded vector and lexical pools. A literal hit can
+        # have weak cosine similarity and must reach the service-level lexical gate.
         merged: list[dict[str, Any]] = []
-        seen_identities: set[tuple[str, str]] = set()
+        seen_source_keys: set[str] = set()
         for result in vector_results[:limit] + lexical_results[:limit]:
-            identity = (str(result["store_id"]), str(result["entry_id"]))
-            if identity in seen_identities:
+            identity = str(result["source_key"])
+            if identity in seen_source_keys:
                 continue
-            seen_identities.add(identity)
+            seen_source_keys.add(identity)
             merged.append(result)
         return merged
 
@@ -823,14 +710,14 @@ class Database:
         with self.session() as connection:
             counts = {
                 table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-                for table in ("messages", "attachments", "chunks")
+                for table in ("documents", "parts", "chunks")
             }
             extraction = {
                 row["extraction_status"]: int(row["amount"])
                 for row in connection.execute(
                     """
                     SELECT extraction_status, COUNT(*) AS amount
-                    FROM attachments GROUP BY extraction_status
+                    FROM parts GROUP BY extraction_status
                     """
                 )
             }
@@ -844,7 +731,7 @@ class Database:
             database_bytes = 0
         return {
             **counts,
-            "attachment_extraction": extraction,
+            "part_extraction": extraction,
             "database_bytes": database_bytes,
             "schema_version": SCHEMA_VERSION,
             "embedding_model": meta.get("embedding_model"),

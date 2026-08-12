@@ -43,8 +43,10 @@ static_assert(sizeof(void*) == 8, "OutlookMapiReader must be compiled as x64.");
 constexpr std::size_t kQueryBatchSize = 64;
 constexpr std::size_t kMaximumCliLimit = 1'000'000;
 constexpr std::size_t kMaximumBodyChars = 4'000'000;
+constexpr std::size_t kMaximumAttachmentsPerMessage = 4'095;
 constexpr std::uint64_t kMaximumCliByteLimit = 1ULL << 40;  // 1 TiB hard ceiling.
 constexpr std::uint64_t kDefaultMaxAttachmentBytes = 64ULL * 1024 * 1024;
+constexpr std::uint64_t kDefaultMaxMessageAttachmentBytes = 64ULL * 1024 * 1024;
 constexpr std::uint64_t kDefaultMaxTotalAttachmentBytes = 0;  // Unlimited across streamed messages.
 constexpr DWORD kAttachmentReadBufferBytes = 64 * 1024;
 
@@ -55,8 +57,9 @@ struct Options {
     std::size_t bodyPreviewChars = 240;
     bool jsonl = false;
     std::wstring storeContains;
-    fs::path spoolDirectory;
+    fs::path attachmentDirectory;
     std::uint64_t maxAttachmentBytes = kDefaultMaxAttachmentBytes;
+    std::uint64_t maxMessageAttachmentBytes = kDefaultMaxMessageAttachmentBytes;
     std::uint64_t maxTotalAttachmentBytes = kDefaultMaxTotalAttachmentBytes;
 };
 
@@ -320,7 +323,29 @@ std::wstring CompactForConsole(std::wstring text) {
 std::wstring JsonEscape(const std::wstring& text) {
     std::wostringstream escaped;
     escaped << std::hex << std::uppercase << std::setfill(L'0');
-    for (const wchar_t character : text) {
+    for (std::size_t index = 0; index < text.size(); ++index) {
+        const wchar_t character = text[index];
+        const unsigned int codeUnit = static_cast<unsigned int>(character);
+
+        if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+            const bool hasLowSurrogate = index + 1 < text.size() &&
+                static_cast<unsigned int>(text[index + 1]) >= 0xDC00 &&
+                static_cast<unsigned int>(text[index + 1]) <= 0xDFFF;
+            if (!hasLowSurrogate) {
+                escaped << L"\\uFFFD";
+                continue;
+            }
+
+            escaped << L"\\u" << std::setw(4) << codeUnit
+                    << L"\\u" << std::setw(4)
+                    << static_cast<unsigned int>(text[++index]);
+            continue;
+        }
+        if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
+            escaped << L"\\uFFFD";
+            continue;
+        }
+
         switch (character) {
             case L'"': escaped << L"\\\""; break;
             case L'\\': escaped << L"\\\\"; break;
@@ -330,11 +355,11 @@ std::wstring JsonEscape(const std::wstring& text) {
             case L'\r': escaped << L"\\r"; break;
             case L'\t': escaped << L"\\t"; break;
             default:
-                // Escaping UTF-16 surrogate code units also makes malformed provider
-                // strings harmless and preserves valid surrogate pairs in JSON.
-                if (character < L' ' || (character >= 0xD800 && character <= 0xDFFF)) {
+                // JSON permits only scalar Unicode values: valid UTF-16 pairs are
+                // emitted above as two escapes, and isolated surrogates become U+FFFD.
+                if (character < L' ') {
                     escaped << L"\\u" << std::setw(4)
-                            << static_cast<unsigned int>(character);
+                            << codeUnit;
                 } else {
                     escaped << character;
                 }
@@ -443,29 +468,28 @@ std::wstring SanitizeAttachmentName(const std::wstring& rawName) {
     return name.empty() ? L"attachment.bin" : name;
 }
 
-fs::path PrepareSpoolDirectory(const fs::path& requested) {
+fs::path PrepareAttachmentDirectory(const fs::path& requested) {
     if (requested.empty()) {
         return {};
     }
 
     std::error_code error;
-    fs::create_directories(requested, error);
-    if (error || !fs::is_directory(requested, error) || error) {
-        throw std::invalid_argument("cannot create or access --spool-dir");
+    if (!fs::is_directory(requested, error) || error) {
+        throw std::invalid_argument("--attachment-dir must be an existing directory");
     }
 
     fs::path canonical = fs::canonical(requested, error);
     if (error || canonical.empty()) {
-        throw std::invalid_argument("cannot canonicalize --spool-dir");
+        throw std::invalid_argument("cannot canonicalize --attachment-dir");
     }
     if (canonical == canonical.root_path()) {
-        throw std::invalid_argument("--spool-dir must not be a filesystem root");
+        throw std::invalid_argument("--attachment-dir must not be a filesystem root");
     }
     return canonical;
 }
 
 fs::path CreateContainedAttachmentFile(
-    const fs::path& spoolDirectory,
+    const fs::path& attachmentDirectory,
     const std::wstring& entryId,
     const ULONG attachmentNumber,
     const std::wstring& safeName,
@@ -485,9 +509,9 @@ fs::path CreateContainedAttachmentFile(
         const std::wstring candidateName = attempt == 0
             ? base
             : std::to_wstring(attempt) + L"_" + base;
-        const fs::path candidate = spoolDirectory / candidateName;
-        if (candidate.parent_path() != spoolDirectory) {
-            throw std::runtime_error("attachment path escaped spool directory");
+        const fs::path candidate = attachmentDirectory / candidateName;
+        if (candidate.parent_path() != attachmentDirectory) {
+            throw std::runtime_error("attachment path escaped attachment directory");
         }
 
         HANDLE rawFile = CreateFileW(
@@ -504,10 +528,10 @@ fs::path CreateContainedAttachmentFile(
         }
         const DWORD createError = GetLastError();
         if (createError != ERROR_FILE_EXISTS && createError != ERROR_ALREADY_EXISTS) {
-            throw std::runtime_error("CreateFileW failed for attachment spool file");
+            throw std::runtime_error("CreateFileW failed for attachment file");
         }
     }
-    throw std::runtime_error("could not allocate a unique attachment spool file");
+    throw std::runtime_error("could not allocate a unique attachment file");
 }
 
 struct AttachmentInfo {
@@ -519,7 +543,7 @@ struct AttachmentInfo {
 
 bool SaveAttachmentStream(
     IStream* stream,
-    const fs::path& spoolDirectory,
+    const fs::path& attachmentDirectory,
     const std::wstring& entryId,
     const ULONG attachmentNumber,
     const std::wstring& safeName,
@@ -531,14 +555,14 @@ bool SaveAttachmentStream(
     fs::path target;
     try {
         target = CreateContainedAttachmentFile(
-            spoolDirectory,
+            attachmentDirectory,
             entryId,
             attachmentNumber,
             safeName,
             output);
     } catch (const std::exception&) {
         ++counters.errors;
-        std::wcerr << L"  [error] could not create contained attachment spool file\n";
+        std::wcerr << L"  [error] could not create contained attachment file\n";
         return false;
     }
 
@@ -569,7 +593,7 @@ bool SaveAttachmentStream(
         if (!WriteFile(output.get(), buffer.data(), bytesRead, &bytesWritten, nullptr) ||
             bytesWritten != bytesRead) {
             ++counters.errors;
-            std::wcerr << L"  [error] WriteFile(attachment spool) failed\n";
+            std::wcerr << L"  [error] WriteFile(attachment file) failed\n";
             break;
         }
         total += bytesRead;
@@ -577,7 +601,17 @@ bool SaveAttachmentStream(
 
     output.reset();
     if (!complete) {
-        DeleteFileW(target.c_str());
+        if (!DeleteFileW(target.c_str())) {
+            const DWORD deleteError = GetLastError();
+            if (deleteError != ERROR_FILE_NOT_FOUND) {
+                ++counters.errors;
+                std::wcerr << L"  [error] could not remove incomplete attachment file: "
+                           << deleteError << L'\n';
+                // Do not write any later attachment when an unaccounted partial
+                // file may still consume the caller-owned directory budget.
+                throw std::runtime_error("could not remove incomplete attachment file");
+            }
+        }
         return false;
     }
 
@@ -739,8 +773,12 @@ std::vector<AttachmentInfo> ReadAttachments(
     IMessage* message,
     const std::wstring& entryId,
     const Options& options,
-    Counters& counters) {
+    Counters& counters,
+    bool& attachmentsTruncated) {
     std::vector<AttachmentInfo> result;
+    attachmentsTruncated = false;
+    std::uint64_t messageAttachmentBytesSaved = 0;
+    std::size_t attachmentRowsSeen = 0;
     LPMAPITABLE rawTable = nullptr;
     const HRESULT tableStatus = message->GetAttachmentTable(MAPI_DEFERRED_ERRORS, &rawTable);
     if (tableStatus == MAPI_E_NO_SUPPORT || tableStatus == MAPI_E_NOT_FOUND) {
@@ -777,6 +815,14 @@ std::vector<AttachmentInfo> ReadAttachments(
         }
 
         for (ULONG rowIndex = 0; rowIndex < rawRows->cRows; ++rowIndex) {
+            if (attachmentRowsSeen >= kMaximumAttachmentsPerMessage) {
+                attachmentsTruncated = true;
+                std::wcerr << L"  [warning] attachments truncated at per-message cap: "
+                           << kMaximumAttachmentsPerMessage << L'\n';
+                return result;
+            }
+            ++attachmentRowsSeen;
+
             const SRow& row = rawRows->aRow[rowIndex];
             const SPropValue* numberProperty = FindProperty(
                 row.lpProps,
@@ -842,7 +888,7 @@ std::vector<AttachmentInfo> ReadAttachments(
             if (info.name.empty()) {
                 info.name = L"attachment-" + std::to_wstring(attachmentNumber) + L".bin";
             }
-            const std::wstring safeSpoolName = SanitizeAttachmentName(info.name);
+            const std::wstring safeAttachmentName = SanitizeAttachmentName(info.name);
             info.contentType = PropertyStringById(
                 rawProperties,
                 propertyCount,
@@ -865,8 +911,20 @@ std::vector<AttachmentInfo> ReadAttachments(
 
             ++counters.attachments;
             bool saved = false;
-            if (method == ATTACH_BY_VALUE && !options.spoolDirectory.empty() &&
-                options.maxAttachmentBytes != 0) {
+            const std::uint64_t messageRemaining =
+                messageAttachmentBytesSaved >= options.maxMessageAttachmentBytes
+                ? 0
+                : options.maxMessageAttachmentBytes - messageAttachmentBytesSaved;
+            const std::uint64_t totalRemaining = options.maxTotalAttachmentBytes == 0
+                ? std::numeric_limits<std::uint64_t>::max()
+                : (counters.attachmentBytesSaved >= options.maxTotalAttachmentBytes
+                    ? 0
+                    : options.maxTotalAttachmentBytes - counters.attachmentBytesSaved);
+            const std::uint64_t allowed = std::min(
+                options.maxAttachmentBytes,
+                std::min(messageRemaining, totalRemaining));
+            if (method == ATTACH_BY_VALUE && !options.attachmentDirectory.empty() &&
+                allowed != 0) {
                 LPUNKNOWN rawStream = nullptr;
                 const HRESULT streamStatus = attachment->OpenProperty(
                     PR_ATTACH_DATA_BIN,
@@ -886,24 +944,19 @@ std::vector<AttachmentInfo> ReadAttachments(
                             streamStat.cbSize.LowPart;
                     }
 
-                    const std::uint64_t totalRemaining = options.maxTotalAttachmentBytes == 0
-                        ? std::numeric_limits<std::uint64_t>::max()
-                        : (counters.attachmentBytesSaved >= options.maxTotalAttachmentBytes
-                            ? 0
-                            : options.maxTotalAttachmentBytes - counters.attachmentBytesSaved);
-                    const std::uint64_t allowed = std::min(
-                        options.maxAttachmentBytes,
-                        totalRemaining);
-                    if (allowed != 0 && info.size <= allowed) {
+                    if (info.size <= allowed) {
                         saved = SaveAttachmentStream(
                             stream,
-                            options.spoolDirectory,
+                            options.attachmentDirectory,
                             entryId,
                             attachmentNumber,
-                            safeSpoolName,
+                            safeAttachmentName,
                             allowed,
                             info,
                             counters);
+                        if (saved) {
+                            messageAttachmentBytesSaved += info.size;
+                        }
                     }
                 } else if (streamStatus != MAPI_E_NOT_FOUND && streamStatus != MAPI_E_NO_SUPPORT) {
                     PrintMapiError(L"IAttach::OpenProperty(PR_ATTACH_DATA_BIN)", streamStatus, counters);
@@ -1060,11 +1113,13 @@ void PrintMessage(
         propertyCount,
         PROP_ID(PR_CONVERSATION_ID));
     const BodyPreview body = ReadBody(message, options.bodyPreviewChars);
+    bool attachmentsTruncated = false;
     const std::vector<AttachmentInfo> attachments = ReadAttachments(
         message,
         entryId,
         options,
-        counters);
+        counters,
+        attachmentsTruncated);
 
     ++counters.messages;
     if (options.jsonl) {
@@ -1077,6 +1132,8 @@ void PrintMessage(
                    << L"\",\"body\":\"" << JsonEscape(body.available ? body.text : L"")
                    << L"\",\"body_available\":" << (body.available ? L"true" : L"false")
                    << L",\"body_truncated\":" << (body.truncated ? L"true" : L"false")
+                   << L",\"attachments_truncated\":"
+                   << (attachmentsTruncated ? L"true" : L"false")
                    << L",\"sender_name\":\"" << JsonEscape(senderName)
                    << L"\",\"sender_email\":\"" << JsonEscape(senderEmail)
                    << L"\",\"to\":\"" << JsonEscape(displayTo)
@@ -1112,7 +1169,8 @@ void PrintMessage(
                << L"      Subject: " << (printableSubject.empty() ? L"<empty>" : printableSubject) << L'\n'
                << L"      EntryID: " << entryId << L'\n'
                << L"      StoreID: " << storeId << L'\n'
-               << L"      Attachments: " << attachments.size() << L'\n';
+               << L"      Attachments: " << attachments.size()
+               << (attachmentsTruncated ? L" ... <truncated>" : L"") << L'\n';
     if (body.available) {
         std::wcout << L"      Body:    " << (printableBody.empty() ? L"<empty>" : printableBody)
                    << (body.truncated ? L" ... <truncated>" : L"") << L'\n';
@@ -1569,11 +1627,15 @@ void PrintUsage(std::wostream& output) {
         << L"  --store-contains TEXT   Only open stores whose display name contains TEXT\n"
         << L"  --body-preview-chars N  Body characters to read/print; 0 disables preview\n"
         << L"                          (default: 240; maximum: 4000000)\n"
-        << L"  --spool-dir PATH        Explicit directory for bounded by-value attachment\n"
-        << L"                          extraction; omitted = metadata only/no file writes\n"
+        << L"  --attachment-dir PATH   Per-run directory owned by the caller for bounded\n"
+        << L"                          by-value extraction; omitted = metadata only/no writes\n"
         << L"  --max-attachment-bytes N\n"
         << L"                          Per-attachment hard cap; 0 disables extraction\n"
         << L"                          (default: 67108864 / 64 MiB)\n"
+        << L"  --max-message-attachment-bytes N\n"
+        << L"                          Per-message extracted-byte cap; 0 disables extraction\n"
+        << L"                          (default: 67108864 / 64 MiB)\n"
+        << L"                          Attachment output is also capped at 4095 rows/message\n"
         << L"  --max-total-attachment-bytes N\n"
         << L"                          Per-process extracted-byte cap; 0 = unlimited\n"
         << L"                          (default: 0; per-attachment cap still applies)\n"
@@ -1594,7 +1656,7 @@ bool ParseOptions(const int argc, wchar_t* argv[], Options& options) {
             continue;
         }
 
-        if (argument == L"--store-contains" || argument == L"--spool-dir") {
+        if (argument == L"--store-contains" || argument == L"--attachment-dir") {
             if (index + 1 >= argc) {
                 std::wcerr << L"Missing value for " << argument << L'\n';
                 throw std::invalid_argument("missing option value");
@@ -1602,7 +1664,7 @@ bool ParseOptions(const int argc, wchar_t* argv[], Options& options) {
             if (argument == L"--store-contains") {
                 options.storeContains = argv[++index];
             } else {
-                options.spoolDirectory = argv[++index];
+                options.attachmentDirectory = argv[++index];
             }
             continue;
         }
@@ -1625,6 +1687,8 @@ bool ParseOptions(const int argc, wchar_t* argv[], Options& options) {
                 kMaximumBodyChars);
         } else if (argument == L"--max-attachment-bytes") {
             options.maxAttachmentBytes = ParseByteLimit(value, argument.c_str());
+        } else if (argument == L"--max-message-attachment-bytes") {
+            options.maxMessageAttachmentBytes = ParseByteLimit(value, argument.c_str());
         } else if (argument == L"--max-total-attachment-bytes") {
             options.maxTotalAttachmentBytes = ParseByteLimit(value, argument.c_str());
         } else {
@@ -1632,7 +1696,7 @@ bool ParseOptions(const int argc, wchar_t* argv[], Options& options) {
             throw std::invalid_argument("unknown option");
         }
     }
-    options.spoolDirectory = PrepareSpoolDirectory(options.spoolDirectory);
+    options.attachmentDirectory = PrepareAttachmentDirectory(options.attachmentDirectory);
     return true;
 }
 
@@ -1685,10 +1749,11 @@ int wmain(const int argc, wchar_t* argv[]) {
                    << L", messages=" << options.maxMessages
                    << L", body-preview=" << options.bodyPreviewChars << L" chars"
                    << L", attachment=" << options.maxAttachmentBytes << L" bytes"
+                   << L", attachment-message=" << options.maxMessageAttachmentBytes << L" bytes"
                    << L", attachment-total=" << options.maxTotalAttachmentBytes << L" bytes"
-                   << (options.spoolDirectory.empty()
+                   << (options.attachmentDirectory.empty()
                        ? L", attachment-mode=metadata-only"
-                       : L", attachment-mode=bounded-spool")
+                       : L", attachment-mode=bounded-directory")
                    << (options.storeContains.empty()
                        ? L""
                        : L", store-filter=\"" + options.storeContains + L"\"")
