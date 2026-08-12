@@ -16,7 +16,7 @@
     <ProjectGuid>{51F47E61-B76A-4EA6-A62A-81A25B6F80FA}</ProjectGuid>
     <RootNamespace>NativeMapiProbe</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <MapiIncludeDir Condition="'$(MapiIncludeDir)'=='' and Exists('C:\Program Files\Microsoft SDKs\Office\14.0\Include\MAPIX.h')">C:\Program Files\Microsoft SDKs\Office\14.0\Include</MapiIncludeDir>
+    <MapiIncludeDir Condition="'$(MapiIncludeDir)'==''">$(MSBuildThisFileDirectory)..\third_party\MAPIStubLibrary\include</MapiIncludeDir>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
@@ -42,6 +42,10 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64' or '$(Configuration)|$(Platform)'=='Release|x64'">
+    <OutDir>$(MSBuildThisFileDirectory)build-direct\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)build-direct\obj\$(Configuration)\</IntDir>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
@@ -84,9 +88,28 @@
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\third_party\MAPIStubLibrary\include\MAPICode.h" />
+    <ClInclude Include="..\third_party\MAPIStubLibrary\include\MAPIDefS.h" />
+    <ClInclude Include="..\third_party\MAPIStubLibrary\include\MAPIGuid.h" />
+    <ClInclude Include="..\third_party\MAPIStubLibrary\include\MAPITags.h" />
+    <ClInclude Include="..\third_party\MAPIStubLibrary\include\MAPIUtil.h" />
+    <ClInclude Include="..\third_party\MAPIStubLibrary\include\MAPIX.h" />
+  </ItemGroup>
+  <ItemGroup>
     <None Include="CMakeLists.txt" />
     <None Include="README.md" />
+    <None Include="..\THIRD_PARTY_NOTICES.md" />
+    <None Include="..\third_party\MAPIStubLibrary\LICENSE" />
+    <None Include="..\third_party\MAPIStubLibrary\README.md" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CopyThirdPartyNotices" AfterTargets="Build">
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\THIRD_PARTY_NOTICES.md"
+          DestinationFiles="$(OutDir)THIRD_PARTY_NOTICES.md"
+          SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\third_party\MAPIStubLibrary\LICENSE"
+          DestinationFiles="$(OutDir)MAPIStubLibrary-LICENSE.txt"
+          SkipUnchangedFiles="true" />
+  </Target>
   <ImportGroup Label="ExtensionTargets" />
 </Project>

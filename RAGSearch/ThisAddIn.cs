@@ -7,8 +7,6 @@ namespace RAGSearch
     public partial class ThisAddIn
     {
         private LocalServiceClient serviceClient;
-        private OutlookItemExtractor itemExtractor;
-        private OutlookIndexer indexer;
         private OomGuardProbe oomGuardProbe;
         private NativeImportRunner nativeImportRunner;
         private NativeSearchPresenter nativeSearchPresenter;
@@ -25,17 +23,9 @@ namespace RAGSearch
                 serviceClient = new LocalServiceClient();
                 StartupTrace.Step("END LocalServiceClient constructor");
 
-                StartupTrace.Step("BEGIN OutlookItemExtractor constructor (filesystem spool only)");
-                itemExtractor = new OutlookItemExtractor();
-                StartupTrace.Step("END OutlookItemExtractor constructor");
-
-                StartupTrace.Step("BEGIN OutlookIndexer constructor (OOM Session is deferred to Debug OOM click)");
-                indexer = new OutlookIndexer(Application, serviceClient, itemExtractor);
-                StartupTrace.Step("END OutlookIndexer constructor");
-
                 oomGuardProbe = new OomGuardProbe(Application);
                 nativeImportRunner = new NativeImportRunner(serviceClient);
-                StartupTrace.Step("constructed native runner and lazy OOM helpers");
+                StartupTrace.Step("constructed native runner and explicit OOM diagnostic");
 
                 StartupTrace.Step("BEGIN Application.ActiveExplorer (window lookup; no mail/address getters)");
                 taskPaneExplorer = Application.ActiveExplorer();
@@ -48,7 +38,6 @@ namespace RAGSearch
                     StartupTrace.Step("BEGIN SearchPaneControl constructor (WinForms only)");
                     searchPaneControl = new SearchPaneControl(
                         serviceClient,
-                        indexer,
                         oomGuardProbe,
                         nativeImportRunner,
                         nativeSearchPresenter.GetCurrentScope,
@@ -111,11 +100,9 @@ namespace RAGSearch
                 throw;
             }
 
-            // Do not subscribe NewMailEx to the Outlook Object Model extractor.
-            // Outlook can replay that event while the add-in is still starting,
-            // which would trigger Object Model Guard before the user does anything.
-            // Production ingestion is the explicit Extended MAPI child process;
-            // the legacy OOM scanner is available only from the labelled debug button.
+            // Production ingestion is the explicit Extended MAPI child process.
+            // The labelled diagnostic button performs one deliberate protected OOM
+            // getter; there is no Outlook Object Model indexing path in the add-in.
         }
 
         private void ThisAddIn_Shutdown(object sender, EventArgs e)
@@ -137,12 +124,6 @@ namespace RAGSearch
             {
                 nativeSearchPresenter.Dispose();
                 nativeSearchPresenter = null;
-            }
-
-            if (indexer != null)
-            {
-                indexer.Dispose();
-                indexer = null;
             }
 
             oomGuardProbe = null;

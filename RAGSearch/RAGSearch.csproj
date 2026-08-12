@@ -29,8 +29,10 @@
     <LoadBehavior>3</LoadBehavior>
     <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
     <DefineConstants>VSTO40;UseOfficeInterop</DefineConstants>
-    <SignManifests>true</SignManifests>
-    <ManifestCertificateThumbprint>57CE1AB34E6D8D230357B8B494BB214A8A45DF04</ManifestCertificateThumbprint>
+    <!-- Do not pin a machine-specific developer thumbprint in source control.
+         The full VSTO Build target requires SignManifests=true plus a locally owned
+         certificate; scripts\build.ps1 supplies both explicitly. -->
+    <SignManifests Condition="'$(SignManifests)' == ''">false</SignManifests>
     <BootstrapperEnabled>true</BootstrapperEnabled>
     <BootstrapperComponentsLocation>HomeSite</BootstrapperComponentsLocation>
     <ResolveComReferenceSilent>true</ResolveComReferenceSilent>
@@ -201,8 +203,6 @@
     <Compile Include="NativeImportRunner.cs" />
     <Compile Include="NativeSearchPresenter.cs" />
     <Compile Include="OomGuardProbe.cs" />
-    <Compile Include="OutlookIndexer.cs" />
-    <Compile Include="OutlookItemExtractor.cs" />
     <Compile Include="SearchPaneControl.cs">
       <SubType>UserControl</SubType>
     </Compile>
@@ -233,6 +233,16 @@
     <Compile Include="ThisAddIn.Designer.cs">
       <DependentUpon>ThisAddIn.Designer.xml</DependentUpon>
     </Compile>
+    <Content Include="..\THIRD_PARTY_NOTICES.md">
+      <Link>THIRD_PARTY_NOTICES.md</Link>
+      <TargetPath>THIRD_PARTY_NOTICES.md</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="..\third_party\MAPIStubLibrary\LICENSE">
+      <Link>MAPIStubLibrary-LICENSE.txt</Link>
+      <TargetPath>MAPIStubLibrary-LICENSE.txt</TargetPath>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <AppDesigner Include="Properties\" />
   </ItemGroup>
   <PropertyGroup>

@@ -57,22 +57,6 @@ namespace RAGSearch
                 .ConfigureAwait(true);
         }
 
-        public async Task<IngestResponse> IngestAsync(
-            IList<MessagePayload> messages,
-            CancellationToken cancellationToken)
-        {
-            var payload = new IngestRequest
-            {
-                messages = new List<MessagePayload>(messages)
-            };
-            return await SendAsync<IngestResponse>(
-                    HttpMethod.Post,
-                    "v1/messages",
-                    payload,
-                    cancellationToken)
-                .ConfigureAwait(true);
-        }
-
         public async Task<SearchResponse> SearchAsync(
             string query,
             int limit,

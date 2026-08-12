@@ -12,19 +12,36 @@ endif()
 
 add_executable(NativeMapiProbe main.cpp)
 
-set(MAPI_INCLUDE_DIR "" CACHE PATH "Directory containing MAPIX.h/MAPITags.h")
-if(NOT MAPI_INCLUDE_DIR)
-    find_path(MAPI_INCLUDE_DIR
-        NAMES MAPIX.h mapix.h
-        HINTS
-            "$ENV{MAPI_INCLUDE_DIR}"
-            "C:/Program Files/Microsoft SDKs/Office/14.0/Include")
+set_target_properties(NativeMapiProbe PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/build-direct"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/build-direct"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/build-direct"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}/build-direct"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}/build-direct")
+
+set(_MAPI_INCLUDE_DEFAULT
+    "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/MAPIStubLibrary/include")
+if(DEFINED ENV{MAPI_INCLUDE_DIR} AND NOT "$ENV{MAPI_INCLUDE_DIR}" STREQUAL "")
+    set(_MAPI_INCLUDE_DEFAULT "$ENV{MAPI_INCLUDE_DIR}")
 endif()
-if(NOT MAPI_INCLUDE_DIR)
-    message(FATAL_ERROR
-        "Extended MAPI headers were not found. Install MAPIStubLibrary headers "
-        "or configure -DMAPI_INCLUDE_DIR=<path-to-MAPIStubLibrary/include>.")
-endif()
+set(MAPI_INCLUDE_DIR
+    "${_MAPI_INCLUDE_DEFAULT}"
+    CACHE PATH
+    "Directory containing MAPIX.h/MAPITags.h")
+foreach(_MAPI_HEADER IN ITEMS
+        MAPICode.h
+        MAPIDefS.h
+        MAPIGuid.h
+        MAPITags.h
+        MAPIUtil.h
+        MAPIX.h)
+    if(NOT EXISTS "${MAPI_INCLUDE_DIR}/${_MAPI_HEADER}")
+        message(FATAL_ERROR
+            "Extended MAPI header ${_MAPI_HEADER} was not found. Restore "
+            "third_party/MAPIStubLibrary/include or configure "
+            "-DMAPI_INCLUDE_DIR=<path-to-MAPIStubLibrary/include>.")
+    endif()
+endforeach()
 
 target_include_directories(NativeMapiProbe PRIVATE "${MAPI_INCLUDE_DIR}")
 
@@ -40,3 +57,12 @@ if(MSVC)
 endif()
 
 target_link_libraries(NativeMapiProbe PRIVATE MAPI32 Ole32)
+
+add_custom_command(TARGET NativeMapiProbe POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/../THIRD_PARTY_NOTICES.md"
+        "$<TARGET_FILE_DIR:NativeMapiProbe>/THIRD_PARTY_NOTICES.md"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/MAPIStubLibrary/LICENSE"
+        "$<TARGET_FILE_DIR:NativeMapiProbe>/MAPIStubLibrary-LICENSE.txt"
+    COMMENT "Copying third-party license notices")

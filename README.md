@@ -1,125 +1,185 @@
-# RAGSearch for classic Outlook
+# RAGSearch
 
-Локальный прототип гибридного поиска по classic Outlook: VSTO-панель сверху, Python-сервис с SQLite/FTS5 и локальными embeddings, а также read-only Extended MAPI reader для чтения PST и текущего Exchange/OST store без Outlook Object Model Guard.
+Экспериментальный локальный поиск по почте, совместимый с classic Microsoft Outlook
+для Windows x64.
+VSTO-надстройка показывает панель поиска, отдельный C++ worker читает настроенный
+Outlook profile через read-only Extended MAPI, а Python-сервис индексирует письма
+и вложения в SQLite/FTS5.
 
-Главный вывод эксперимента: `Application.IsTrusted` не является обходом защиты. Обычная VSTO-надстройка действительно считается Outlook доверенной, но политика `AddinTrust=2` должна принудительно вернуть её под Object Model Guard. Поддерживаемый путь без prompt при неизменной политике — читать store provider через Extended MAPI, а не отключать Guard и не копировать заблокированный `.ost`.
+```text
+classic Outlook + VSTO UI
+          │
+          ▼
+C++ Extended MAPI reader ──JSONL──► Python adapter ──HTTP──► Python search service
+          ▲                                                       │
+          └──────── Outlook profile/providers          SQLite + FTS5 + embeddings
+```
 
-Подробный журнал с точными policy-значениями, доказательствами и ограничениями: [docs/PROTOTYPE_NOTES.md](docs/PROTOTYPE_NOTES.md).
+Extended MAPI здесь не является скачанным Python-пакетом. Во время сборки
+используются закреплённые в репозитории официальные Microsoft headers; линковочные
+библиотеки даёт Windows SDK, а MAPI provider во время работы — classic Outlook.
+Подробнее: [архитектура и границы компонентов](docs/ARCHITECTURE_AND_MAPI.md).
 
-## Что работает
+## Что уже находится в репозитории
 
-- Верхняя панель `RAG Search` внутри Outlook.
-- Гибридный FTS5 + vector поиск по сообщениям и вложениям.
-- Для фраз сервис ранжирует semantic-кандидатов по минимальному vector distance до лучшего чанка и применяет adaptive cutoff. API допускает до 25 результатов, а native Outlook-проекция запрашивает максимум 12 — столько же, сколько безопасно помещается в финальный AQS. Для одного слова literal token/prefix/substring имеет приоритет; без literal-совпадения заведомо нестабильный dense guess не показывается.
-- Результаты всего локального индекса проецируются в штатный центральный список через `Explorer.Search(..., olSearchScopeAllFolders)`: один `All Mailboxes` view объединяет Inbox, Sent и выбранные Outlook архивные/PST stores.
-- Кнопка `Сбросить фильтр` вызывает `Explorer.ClearSearch()` и возвращает обычный список исходной папки.
-- Основная кнопка индексации запускает отдельный read-only Extended MAPI worker; отдельная debug-кнопка синхронно читает один protected OOM getter на одном письме и служит negative control.
-- Кнопка `Очистить базу` после подтверждения удаляет только локальный поисковый индекс и позволяет повторить векторизацию с нуля; Outlook, PST и OST не изменяются.
-- Надстройка не подписывает OOM extractor на `NewMailEx`, поэтому сама RAGSearch больше не должна вызывать Guard во время старта Outlook.
-- Если loopback Python-сервис не отвечает, панель запускает workspace `service\.venv` без shell/UAC, ограниченно ждёт `/health` и затем начинает native import.
-- Read-only x64 Extended MAPI probe читает и текущий Exchange/OST store, и `archive.pst` через Outlook profile/store provider; `.ost` как файл не открывается и не копируется.
-- Native JSONL adapter отправляет прочитанные сообщения в локальный Python API без Outlook COM.
-- Loopback-only API защищён локальным токеном; attachment spool ограничен `%LOCALAPPDATA%\RAGSearch\spool`.
+- исходники VSTO-надстройки, native x64 worker и Python-сервиса;
+- шесть необходимых headers Microsoft MAPIStubLibrary, их MIT-лицензия и точный
+  upstream commit в [third_party/MAPIStubLibrary](third_party/MAPIStubLibrary);
+- dependency-free Python provider и тесты — для базового режима сторонние
+  Python-пакеты и скачивание модели не нужны;
+- конфигурации MSBuild и CMake; native EXE собирается в
+  `native-mapi-probe\build-direct\NativeMapiProbe.exe`.
 
-Финальный clean UI-контроль под strict policy: пользователь нажал `Deny` в чужом startup Guard, затем кнопка `Индексировать PST + OST (MAPI)` из панели завершилась статусом `Native-индексация завершена: 42 писем`; нового Guard не появилось.
+В Git намеренно не хранятся `.venv`, build artifacts, база, письма, вложения,
+токены, private signing keys и необязательная neural model.
 
-Outlook не даёт публичного cross-store rowset API отдельно от Instant Search UI. Поэтому presenter строит компактный финальный AQS из тем прошедших service cutoff: каждая тема превращается в обычную кавыченную фразу, после чего поиск запускается с `olSearchScopeAllFolders`. Кавыченные фразы выбраны намеренно: canonical `System.Subject` и локализованные `subject:`/`тема:` на проверенной комбинации ru-RU Windows + en-US Office либо дали ноль, либо зависели от locale. Пустая service-выдача запускает заведомо несуществующую sentinel-фразу и оставляет All Mailboxes пустым до сброса.
+## Требования
 
-Этот компромисс реально собирает один native список из основного OST, Sent и PST `Archives`, но имеет две честные границы. Во-первых, Outlook показывает сгенерированную строку в Search bar и может найти дополнительные письма с той же фразой в теме/теле: поддержанного AQS-сравнения по `(StoreID, EntryID)` нет. Во-вторых, vector distance — внешнее значение SQLite, а native Outlook view сортирует только по свойствам писем, поэтому сервисный top-N и cutoff сохраняются в критериях, но порядок строк выбирает Outlook. Полный набор `cross-store + точная identity + пустой Search bar + vector order` требует собственного result list; Search Folder без строки поиска ограничен одним store.
+Для компиляции из чистого clone:
 
-## PST и OST: что именно читается
+- Windows x64;
+- Visual Studio 2022 с workload `Office/SharePoint development`;
+- `.NET Framework 4.8 Targeting Pack`;
+- workload `Desktop development with C++`, MSVC v143 x64/x86 и Windows 10/11 SDK.
 
-Legacy-класс полного VSTO/OOM-индексатора не парсит файлы:
+Для запуска дополнительно нужны Python 3.11+, VSTO Runtime, classic Outlook x64 и
+настроенный default Outlook profile. Разрядность native worker и Outlook обязана
+совпадать; текущая конфигурация проекта — только x64. CMake 3.20+ необязателен и
+нужен лишь при сборке native worker через CMake вместо MSBuild.
 
-1. `NameSpace.AddStore` подключает отсутствующий PST к Outlook profile.
-2. `Session.Stores` перечисляет PST и Exchange cached store.
-3. Оба читаются через Outlook Object Model и отправляются DTO в Python.
+## Сборка из чистого clone
 
-Поэтому PST читается через подключённый PST provider, а OST — через активный Exchange store provider. Это один и тот же объектный путь; никакого «другого поля OST» нет.
-
-Кнопка `Debug OOM: 1 письмо → Guard` больше не запускает этот полный индексатор. Она требует явно выбранный `MailItem` и сразу читает документированное protected-свойство `MailItem.SenderEmailAddress`. Адрес отбрасывается и не логируется. До исправления кнопка сначала ожидала `/health`, continuation ушёл с Outlook `tid=1` на thread-pool `tid=11`, а запущенный там `WinForms.Timer` не имел message pump; поэтому UI оставался на `0/42` и protected getter вообще не выполнялся.
-
-Native-путь также не трогает raw-файлы. `NativeMapiProbe.exe` выполняет `MAPIInitialize`/`MAPILogonEx`, открывает stores read-only и получает тело/идентификаторы через Extended MAPI. Он уже успешно прочитал оба источника при запущенном Outlook, без Guard popup.
-
-## Outlook Guard — только диагностический контроль
-
-Strict policy установлена вне RAGSearch и подтверждена реальным Outlook Guard warning. Надстройка больше не читает и не изменяет policy/registry; точные воспроизведённые значения сохранены только в журнале прототипа. Для чистого сравнения `OOM prompt` против `Extended MAPI без prompt` нельзя считать отсутствие окна доказательством, пока действует временный grant после `Allow`.
-
-Детерминированный negative control после полного перезапуска Outlook:
-
-1. Выбрать одно обычное письмо в центральном списке и нажать `Debug OOM: 1 письмо → Guard`.
-2. Статус дойдёт до `[2/3]` и синхронно вызовет `MailItem.SenderEmailAddress`; решение `Allow`/`Deny` автоматикой не нажимается.
-3. После решения статус покажет `GETTER_RETURNED`, `DENY_OR_BLOCKED` либо `COM_EXCEPTION` и точный HRESULT. Значение адреса не выводится; технические фазы пишутся в `%LOCALAPPDATA%\RAGSearch\oom-guard-probe.log`.
-
-`GETTER_RETURNED` сам по себе не различает новый `Allow`, уже действующий временный grant и отсутствие enforcement — OOM не сообщает источник разрешения. Для чистого теста нельзя предварительно выдавать временный grant.
-
-При `AddinTrust=2` warning на старте может вызвать любая загруженная COM-надстройка Outlook. В диагностической сборке RAGSearch ранний `%LOCALAPPDATA%\RAGSearch\startup-trace.log` подтвердил завершение всех startup-этапов без protected mail/address getters; настоящий Guard при этом остался открыт от другого компонента. Загружены, в частности, Outlook Social Connector, OneNote, Skype Meeting и Exchange add-ins. Production-кнопка RAGSearch не зависит от их OOM-решения: native adapter E2E прошёл даже при открытом модальном Guard.
-
-## Запуск Python-сервиса
+Команды ниже выполняются из корня репозитория. Чтобы собранная надстройка затем
+могла запустить сервис, создайте ожидаемое ею Python-окружение; базовый режим
+использует только стандартную библиотеку Python:
 
 ```powershell
-cd "$env:USERPROFILE\Desktop\projects\RAGSearch"
+py -3 --version # должно быть 3.11+
+py -3 -m venv .\service\.venv
+```
+
+Соберите оба проекта одной командой. Скрипт находит Visual Studio через `vswhere`,
+собирает native worker и создаёт либо повторно использует локальный non-exportable
+development certificate в `Cert:\CurrentUser\My`, потому что полный VSTO `Build`
+технически требует подписанный manifest:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1
+```
+
+Дополнительные MAPI-файлы скачивать или указывать через include path не нужно.
+`RAGSearch.sln` пока содержит только VSTO-проект, поэтому native worker собирается
+отдельной первой командой.
+
+Сертификат автора и private key в Git не входят. Для повторной сборки можно оставить
+созданный скриптом локальный dev certificate. Чтобы использовать свой уже
+установленный code-signing certificate с private key:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 `
+  -CertificateThumbprint YOUR_CERTIFICATE_THUMBPRINT
+```
+
+Автоматический self-signed certificate разрешён скриптом только для `Debug`.
+`-VstoConfiguration Release` требует явно переданный production certificate.
+
+Скрипт решает воспроизводимость development-сборки, но не доверие к издателю.
+Не коммитьте `.pfx`, private key или локальный thumbprint. Для распространения нужен
+нормальный installer и сертификат, которому доверяет целевая организация;
+репозиторий их не содержит. Автоматически созданный сертификат также может
+потребовать явного доверия в соответствии с локальной ClickOnce/Office policy.
+Ручные MSBuild/CMake команды и overrides описаны в
+[native-mapi-probe/README.md](native-mapi-probe/README.md).
+
+## Запуск
+
+Python-сервис можно запустить вручную:
+
+```powershell
 .\service\.venv\Scripts\python.exe .\service\run.py `
-  --embedding sentence-transformers `
-  --model .\service\models\paraphrase-multilingual-MiniLM-L12-v2 `
   --delete-spool-after-ingest
 ```
 
-Сервис слушает только `127.0.0.1:8765`. База, token и spool находятся в `%LOCALAPPDATA%\RAGSearch`.
+После сборки и регистрации надстройки перезапустите classic Outlook. Если сервис
+не запущен, панель сама использует точный workspace-путь
+`service\.venv\Scripts\python.exe`; при отсутствии локальной neural model включается
+воспроизводимый hashing provider без дополнительных зависимостей.
 
-Dependency-free fallback без нейронной модели:
-
-```powershell
-python .\service\run.py --delete-spool-after-ingest
-```
-
-## Native MAPI ingestion
-
-Локально собранный проверочный binary (build output не хранится в Git):
-
-```powershell
-.\native-mapi-probe\build-direct\NativeMapiProbe.exe --max-messages 5
-.\native-mapi-probe\build-direct\NativeMapiProbe.exe --store-contains Archives --jsonl
-```
-
-Потоковый импорт в основной сервис:
+Ручной потоковый импорт:
 
 ```powershell
 .\service\.venv\Scripts\python.exe .\service\import_native_mapi.py `
-  --probe .\native-mapi-probe\build-direct\NativeMapiProbe.exe `
-  --max-messages 1000
+  --executable .\native-mapi-probe\build-direct\NativeMapiProbe.exe `
+  --full-scan
 ```
 
-JSONL-контракт содержит реальные `store_id`, `entry_id`, `folder_entry_id`, путь/имя store и folder, тему/тело, sender/recipients, даты, Internet Message ID, Conversation ID и attachment metadata. Вложения извлекаются только по явному `--spool-dir`, с canonical path containment и лимитом 64 MiB на файл. Worker выдаёт только `IPM.Note`/`IPM.Note.*`, поэтому Calendar/Contacts/REPORT не загрязняют индекс.
-
-Обычная Visual Studio сборка native-проекта требует workload `Desktop development with C++` и Microsoft MAPIStubLibrary headers. Проверочный EXE собран x64 существующим compiler toolchain; битность совпадает с Outlook x64.
-
-## Сборка VSTO
-
-```powershell
-$msbuild = 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'
-& $msbuild .\RAGSearch.sln /t:PrepareForRun /p:Configuration=Debug /m
-```
-
-Затем перезапустить classic Outlook. Debug manifest подписан локальным dev-сертификатом и регистрируется в `HKCU\Software\Microsoft\Office\Outlook\Addins\RAGSearch`. Для распространения нужен корпоративно одобренный сертификат/installer.
+Необязательные `sentence-transformers` и multilingual model не включены в Git и
+никогда не скачиваются сервисом автоматически. Их локальная настройка описана в
+[service/README.md](service/README.md).
 
 ## Проверки
 
 ```powershell
-python -m unittest discover -s service\tests -t service -v
-powershell.exe -NoProfile -File .\scripts\test_native_mapi_adapter_e2e.ps1
-& $msbuild .\RAGSearch.sln /t:Build /p:Configuration=Debug /m
+.\service\.venv\Scripts\python.exe -B -m unittest `
+  discover -s service\tests -t service -v
+
+.\native-mapi-probe\build-direct\NativeMapiProbe.exe --help
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build.ps1 `
+  -Target Rebuild
 ```
 
-Последний прогон: 33/33 Python tests, native-MAPI-to-service E2E PASS, VSTO rebuild — 0 warnings/0 errors. Отдельный live probe подтвердил один `All Mailboxes` rowset с письмами из Inbox, Sent и PST `Archives`; `View.Filter` поверх него Outlook игнорирует, поэтому production-путь использует финальный AQS. Контрольный read-only MAPI scan дал 42 письма (16 OST + 26 PST), 49 вложений, 31 корректно пропущенный non-mail объект и 0 ошибок; после новых тестовых писем текущая neural DB содержит 44 сообщения, 49 вложений и 1 883 chunks (`schema_version=2`).
+Live E2E требует реального Outlook profile и подготовленного тестового store, поэтому
+не является универсальным тестом чистого clone:
 
-## До production
+```powershell
+powershell.exe -NoProfile -File .\scripts\test_native_mapi_adapter_e2e.ps1
+```
 
-- добавить инкрементальные MAPI notifications/checkpoints вместо полного повторного scan;
-- при необходимости точной cross-store identity заменить AQS-проекцию собственным result list; MAPI Search Folder по `PR_RECORD_KEY` возможен только отдельно в каждом store;
-- заменить brute-force cosine на ANN для больших архивов;
-- добавить reconciliation/tombstones для перемещений и удалений;
-- изолировать тяжёлый extraction, добавить AV/resource quotas;
-- согласовать шифрование, DLP, retention и аудит;
-- для полной Exchange Online истории рассмотреть Graph; OST содержит только доступное cached window;
-- VSTO работает только в classic Outlook.
+Последняя локальная проверка: 33/33 Python tests, подписанный VSTO Rebuild, direct
+native x64 compile и native-to-service E2E — PASS.
+
+## Честные ограничения
+
+- Это workspace-прототип, а не готовый installer или portable package.
+- VSTO работает только в classic Outlook; новый Outlook не поддерживается.
+- Worker читает stores через Outlook MAPI providers, а не парсит PST/OST как файлы.
+- Индексация пока выполняет полный scan; checkpoints, notifications и tombstones не
+  реализованы.
+- Проекция результатов использует Outlook `All Mailboxes` AQS: она может показать
+  дополнительные письма с совпавшей фразой и не сохраняет vector ordering.
+- Локальная neural-конфигурация необязательна и не воспроизводится без отдельно
+  выбранных package/model artifacts.
+
+Подробности эксперимента и Outlook Guard:
+[docs/PROTOTYPE_NOTES.md](docs/PROTOTYPE_NOTES.md). Ограничения проекции:
+[docs/OUTLOOK_SEARCH_PROJECTION.md](docs/OUTLOOK_SEARCH_PROJECTION.md).
+
+## Лицензии и внешние компоненты
+
+Аудит сделан для сценария закрытого платного продукта. В обязательном default
+контуре не обнаружены `Non-Commercial`, GPL/AGPL или иные условия, запрещающие
+продажу либо требующие открыть first-party код. Поэтому proprietary-лицензия на
+собственный код в принципе совместима с текущим составом — при условии, что автор
+владеет правами на contributions и явно исключает сторонние части из своей лицензии.
+
+Это не превращает весь архив в «мою собственность»:
+
+- MAPIStubLibrary headers остаются под MIT; их copyright и полный MIT-текст должны
+  сопровождать исходную и бинарную поставку;
+- две VSTO Utilities DLL остаются Microsoft redistributables и поставляются без
+  изменений на условиях применимой лицензии Visual Studio;
+- Windows, .NET Framework, VSTO Runtime и classic Outlook — внешние лицензируемые
+  prerequisites, а не часть лицензии RAGSearch;
+- optional `sentence-transformers`/model напрямую permissive, но их версии и
+  транзитивный набор не закреплены, поэтому neural-поставка пока не прошла полный
+  лицензионный аудит.
+
+Для собственного кода корневой `LICENSE` пока не выбран. Полная матрица, границы
+проверки и действия перед коммерческой поставкой:
+[docs/LICENSE_COMPATIBILITY.md](docs/LICENSE_COMPATIBILITY.md). Файл, который нужно
+класть рядом с бинарниками: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+`RAGSearch` не аффилирован и не одобрен Microsoft. Microsoft и Outlook являются
+товарными знаками Microsoft group of companies; здесь они используются только для
+описания совместимости.
